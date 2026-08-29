@@ -50,9 +50,140 @@ const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY })
 const AI_INSTRUCTIONS = readFileSync(new URL('./instrucoes.md', import.meta.url), 'utf8')
 const AI_CATALOG = readFileSync(new URL('./catalogo.md', import.meta.url), 'utf8')
 
+// --- Catalog parsing & search ---
+//
+// Sending the full ~275KB catalog as context on every single message is what
+// was driving the API cost up — even with caching, sporadic WhatsApp traffic
+// means the cache keeps expiring between customer messages, so most messages
+// were re-paying to reprocess all 703 products. Instead we parse the catalog
+// once at startup and give the AI a search tool: it only pays for the few
+// products actually relevant to each question.
+
+interface CatalogEntry {
+  category: string
+  subcategory: string
+  heading: string
+  body: string
+}
+
+function parseCatalog(text: string): CatalogEntry[] {
+  const entries: CatalogEntry[] = []
+  let category = ''
+  let subcategory = ''
+  let current: CatalogEntry | null = null
+
+  for (const line of text.split('\n')) {
+    if (line.startsWith('#### Subcategoria:')) {
+      subcategory = line.replace('#### Subcategoria:', '').trim()
+      current = null
+    } else if (line.startsWith('### ')) {
+      current = { category, subcategory, heading: line.replace(/^###\s*/, '').trim(), body: '' }
+      entries.push(current)
+    } else if (line.startsWith('## ')) {
+      category = line.replace(/^##\s*/, '').trim()
+      current = null
+    } else if (line.startsWith('#')) {
+      current = null
+    } else if (current) {
+      current.body += (current.body ? '\n' : '') + line
+    }
+  }
+
+  return entries
+}
+
+const CATALOG_ENTRIES = parseCatalog(AI_CATALOG)
+
+// Compact overview (categories + subcategories only) so the AI knows what
+// exists without paying for the full product list.
+const CATALOG_OVERVIEW = (() => {
+  const byCategory = new Map<string, Set<string>>()
+  for (const e of CATALOG_ENTRIES) {
+    if (!byCategory.has(e.category)) byCategory.set(e.category, new Set())
+    if (e.subcategory) byCategory.get(e.category)!.add(e.subcategory)
+  }
+  const lines: string[] = []
+  for (const [cat, subs] of byCategory) {
+    lines.push(`- ${cat}: ${[...subs].join(', ')}`)
+  }
+  return lines.join('\n')
+})()
+
+function normalize(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+}
+
+const MAX_SEARCH_RESULTS = 8
+const MAX_SEARCH_CHARS = 6000
+
+function searchCatalog(query: string): string {
+  const words = normalize(query).split(/\s+/).filter(Boolean)
+  if (words.length === 0) return 'Termo de busca vazio.'
+
+  const scored = CATALOG_ENTRIES.map((e) => {
+    // Weight matches in the product name / category much higher than a
+    // stray mention buried in some other product's options list — otherwise
+    // e.g. searching "botton" surfaces unrelated products that happen to
+    // list "+2 bottons" as an accessory add-on, burying the actual Botton
+    // products under ties.
+    const heading = normalize(`${e.category} ${e.subcategory} ${e.heading}`)
+    const body = normalize(e.body)
+    let score = 0
+    for (const w of words) {
+      if (heading.includes(w)) score += 5
+      // Count repeated body mentions too (relevant products tend to repeat
+      // the term across variations/tiers), but cap so one huge options list
+      // can't out-rank a real heading match.
+      const bodyHits = body.split(w).length - 1
+      score += Math.min(bodyHits, 3)
+    }
+    return { e, score }
+  })
+    .filter((r) => r.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, MAX_SEARCH_RESULTS)
+
+  if (scored.length === 0) {
+    return `Nenhum produto encontrado para "${query}". Tente outra palavra-chave (nome do produto, categoria ou material).`
+  }
+
+  let out = ''
+  for (const { e } of scored) {
+    const block = `### ${e.heading} [${e.category} / ${e.subcategory}]\n${e.body.trim()}\n\n`
+    if (out.length + block.length > MAX_SEARCH_CHARS) break
+    out += block
+  }
+  return out.trim()
+}
+
+const AI_TOOLS: Anthropic.Messages.Tool[] = [
+  {
+    name: 'buscar_catalogo',
+    description:
+      'Busca produtos no catálogo da Quick Gráfica por palavra-chave (nome do produto, categoria, material, acabamento). Retorna os produtos mais relevantes com preço, formato, material e opções. Use sempre que precisar do preço ou detalhes de um produto — você não tem o catálogo completo na memória.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        termo: {
+          type: 'string',
+          description: 'Palavra-chave de busca, ex: "cartao de visita", "adesivo redondo", "banner lona"',
+        },
+      },
+      required: ['termo'],
+    },
+  },
+]
+
 const AI_SYSTEM: Anthropic.Messages.TextBlockParam[] = [
   { type: 'text', text: AI_INSTRUCTIONS },
-  { type: 'text', text: AI_CATALOG, cache_control: { type: 'ephemeral' } },
+  {
+    type: 'text',
+    text: `Categorias e subcategorias disponíveis no catálogo:\n${CATALOG_OVERVIEW}`,
+    cache_control: { type: 'ephemeral', ttl: '1h' },
+  },
 ]
 
 // --- Queue ---
@@ -211,21 +342,54 @@ function buildHistory(chatId: string, beforeTs: number): Anthropic.Messages.Mess
   return collapsed
 }
 
+// Caps how many search-then-answer round trips a single reply can take —
+// just a safety net against the model looping, not a normal-case limit.
+const MAX_TOOL_ROUNDS = 4
+
 async function handleWithAI(chatId: string, wamid: string, userText: string, ts: number): Promise<void> {
   try {
-    const history = buildHistory(chatId, ts)
-    const response = await anthropic.messages.create({
-      model: AI_MODEL,
-      max_tokens: 4096,
-      system: AI_SYSTEM,
-      messages: [...history, { role: 'user', content: userText || '(mensagem vazia)' }],
-    })
+    const messages: Anthropic.Messages.MessageParam[] = [
+      ...buildHistory(chatId, ts),
+      { role: 'user', content: userText || '(mensagem vazia)' },
+    ]
 
-    const replyText = response.content
-      .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
-      .map((b) => b.text)
-      .join('\n')
-      .trim()
+    let replyText = ''
+
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const response = await anthropic.messages.create({
+        model: AI_MODEL,
+        max_tokens: 2048,
+        system: AI_SYSTEM,
+        tools: AI_TOOLS,
+        messages,
+      })
+
+      const toolUses = response.content.filter(
+        (b): b is Anthropic.Messages.ToolUseBlock => b.type === 'tool_use',
+      )
+
+      if (toolUses.length === 0) {
+        replyText = response.content
+          .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
+          .map((b) => b.text)
+          .join('\n')
+          .trim()
+        break
+      }
+
+      messages.push({ role: 'assistant', content: response.content })
+      messages.push({
+        role: 'user',
+        content: toolUses.map((tu) => {
+          const termo = typeof tu.input === 'object' && tu.input && 'termo' in tu.input ? String((tu.input as { termo: unknown }).termo) : ''
+          return {
+            type: 'tool_result' as const,
+            tool_use_id: tu.id,
+            content: searchCatalog(termo),
+          }
+        }),
+      })
+    }
 
     if (!replyText) return
 
