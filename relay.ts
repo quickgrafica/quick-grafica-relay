@@ -3,6 +3,7 @@ import type { ContentfulStatusCode } from 'hono/utils/http-status'
 import { serve } from '@hono/node-server'
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import { readFileSync, writeFileSync } from 'node:fs'
+import Anthropic from '@anthropic-ai/sdk'
 
 // Load .env — real env wins.
 try {
@@ -20,6 +21,7 @@ const required = [
   'WHATSAPP_VERIFY_TOKEN',
   'WHATSAPP_APP_SECRET',
   'RELAY_SECRET',
+  'ANTHROPIC_API_KEY',
 ] as const
 
 for (const key of required) {
@@ -35,9 +37,23 @@ const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN!
 const APP_SECRET = process.env.WHATSAPP_APP_SECRET!
 const RELAY_SECRET = process.env.RELAY_SECRET!
 const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || RELAY_SECRET
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY!
 const PORT = Number(process.env.PORT ?? 3000)
 const WA_API = `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}`
 const START = Date.now()
+
+// --- AI assistant setup ---
+
+const AI_MODEL = 'claude-sonnet-5'
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY })
+
+const AI_INSTRUCTIONS = readFileSync(new URL('./instrucoes.md', import.meta.url), 'utf8')
+const AI_CATALOG = readFileSync(new URL('./catalogo.md', import.meta.url), 'utf8')
+
+const AI_SYSTEM: Anthropic.Messages.TextBlockParam[] = [
+  { type: 'text', text: AI_INSTRUCTIONS },
+  { type: 'text', text: AI_CATALOG, cache_control: { type: 'ephemeral' } },
+]
 
 // --- Queue ---
 
@@ -129,6 +145,97 @@ async function waApi(
   return { ok: res.ok, status: res.status, data }
 }
 
+// --- Outbound send helper (shared by /send and the AI auto-reply) ---
+
+async function sendText(
+  to: string,
+  text: string,
+  replyTo?: string,
+): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const body: Record<string, unknown> = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'text',
+    text: { body: text },
+  }
+  if (replyTo) body.context = { message_id: replyTo }
+
+  const result = await waApi('/messages', body)
+  if (result.ok) {
+    const wamid = (result.data as { messages?: Array<{ id: string }> }).messages?.[0]?.id
+    logMessage({ direction: 'out', chatId: to, text, timestamp: Date.now(), wamid })
+  }
+  return result
+}
+
+// --- AI auto-reply ---
+//
+// Runs in-process, right when a message arrives — no separate always-on
+// worker needed, so it wakes together with the relay on Railway's free plan
+// (an idle worker with nothing hitting its own HTTP port would never wake up).
+
+const HISTORY_LIMIT = 20
+
+// Serializes handling per chat so two messages arriving close together don't
+// race each other's conversation history / replies. Returns the promise so
+// the webhook handler can await it — on Railway's free plan the container
+// can go back to sleep as soon as the HTTP response is sent, so any work
+// left running in the background after that point may never finish.
+const chatQueues = new Map<string, Promise<void>>()
+
+function enqueueForChat(chatId: string, task: () => Promise<void>): Promise<void> {
+  const prev = chatQueues.get(chatId) ?? Promise.resolve()
+  const next = prev.then(task).catch((err) => console.error('ai: task failed:', err))
+  chatQueues.set(chatId, next)
+  return next
+}
+
+// Avoids double-replying if Meta retries a webhook delivery (e.g. because our
+// response took a while while the AI was thinking).
+const processedForAI = new Set<string>()
+const MAX_PROCESSED_FOR_AI = 5000
+
+function buildHistory(chatId: string, beforeTs: number): Anthropic.Messages.MessageParam[] {
+  const entries = log.filter((e) => e.chatId === chatId && e.timestamp < beforeTs).slice(-HISTORY_LIMIT)
+  const collapsed: Anthropic.Messages.MessageParam[] = []
+  for (const e of entries) {
+    const role: 'user' | 'assistant' = e.direction === 'in' ? 'user' : 'assistant'
+    const last = collapsed[collapsed.length - 1]
+    if (last && last.role === role && typeof last.content === 'string') {
+      last.content = `${last.content}\n${e.text}`
+    } else {
+      collapsed.push({ role, content: e.text })
+    }
+  }
+  while (collapsed.length && collapsed[0].role !== 'user') collapsed.shift()
+  return collapsed
+}
+
+async function handleWithAI(chatId: string, wamid: string, userText: string, ts: number): Promise<void> {
+  try {
+    const history = buildHistory(chatId, ts)
+    const response = await anthropic.messages.create({
+      model: AI_MODEL,
+      max_tokens: 4096,
+      system: AI_SYSTEM,
+      messages: [...history, { role: 'user', content: userText || '(mensagem vazia)' }],
+    })
+
+    const replyText = response.content
+      .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
+      .map((b) => b.text)
+      .join('\n')
+      .trim()
+
+    if (!replyText) return
+
+    const result = await sendText(chatId, replyText, wamid)
+    if (!result.ok) console.error('ai: send failed:', result.data)
+  } catch (err) {
+    console.error('ai: handling failed:', err)
+  }
+}
+
 // --- Webhook payload parsing ---
 
 interface WaMessage {
@@ -160,7 +267,9 @@ interface WaWebhookPayload {
   }>
 }
 
-function parseMessages(payload: WaWebhookPayload): void {
+function parseMessages(payload: WaWebhookPayload): Promise<void>[] {
+  const pending: Promise<void>[] = []
+
   for (const entry of payload.entry ?? []) {
     for (const change of entry.changes ?? []) {
       const value = change.value
@@ -214,10 +323,24 @@ function parseMessages(payload: WaWebhookPayload): void {
             enqueue({ ...base, text: `(unsupported type: ${msg.type})` })
         }
 
-        logMessage({ direction: 'in', chatId: msg.from, pushName, text: logText, timestamp: Date.now(), wamid: msg.id })
+        const ts = Date.now()
+        logMessage({ direction: 'in', chatId: msg.from, pushName, text: logText, timestamp: ts, wamid: msg.id })
+
+        // Skip auto-replying to plain reactions (a 👍 on an old message doesn't need a reply),
+        // and skip messages we've already handled (Meta retried the webhook delivery).
+        if (msg.type !== 'reaction' && !processedForAI.has(msg.id)) {
+          processedForAI.add(msg.id)
+          if (processedForAI.size > MAX_PROCESSED_FOR_AI) {
+            const oldest = processedForAI.values().next().value
+            if (oldest) processedForAI.delete(oldest)
+          }
+          pending.push(enqueueForChat(msg.from, () => handleWithAI(msg.from, msg.id, logText, ts)))
+        }
       }
     }
   }
+
+  return pending
 }
 
 // --- Hono app ---
@@ -257,7 +380,10 @@ app.post('/webhook', async (c) => {
 
   try {
     const payload = JSON.parse(rawBody) as WaWebhookPayload
-    parseMessages(payload)
+    // Await the AI replies before responding — on Railway's free plan the
+    // container can sleep again right after this handler returns, which
+    // would cut off any reply work still running in the background.
+    await Promise.all(parseMessages(payload))
   } catch (err) {
     console.error('webhook: parse error:', err)
   }
@@ -307,19 +433,10 @@ app.get('/poll', (c) => {
 app.post('/send', async (c) => {
   const { to, text, reply_to } = await c.req.json<{ to: string; text: string; reply_to?: string }>()
 
-  const body: Record<string, unknown> = {
-    messaging_product: 'whatsapp',
-    to,
-    type: 'text',
-    text: { body: text },
-  }
-  if (reply_to) body.context = { message_id: reply_to }
-
-  const result = await waApi('/messages', body)
+  const result = await sendText(to, text, reply_to)
   if (!result.ok) return c.json({ error: result.data }, result.status as ContentfulStatusCode)
 
   const wamid = (result.data as { messages?: Array<{ id: string }> }).messages?.[0]?.id
-  logMessage({ direction: 'out', chatId: to, text, timestamp: Date.now(), wamid })
   return c.json({ wamid })
 })
 
