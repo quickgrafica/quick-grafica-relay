@@ -543,9 +543,26 @@ async function handleWizardTap(chatId: string, id: string, replyTo?: string): Pr
       await sendText(chatId, 'Beleza! Pode me contar o que precisa que eu já te ajudo por aqui. 🙂', replyTo)
       return
     }
+    if (id === 'wiz|close') {
+      await sendText(chatId, 'Show! 🙌 Vou passar pra equipe confirmar os detalhes e o pagamento com você. Só um instante!', replyTo)
+      // Flagged in the log so the team can spot closing intents in the /dashboard.
+      logMessage({ direction: 'in', chatId, text: '⭐ Cliente quer fechar o pedido (confirmar pelos bastidores)', timestamp: Date.now() })
+      return
+    }
   } catch (err) {
     console.error('wizard: handling failed:', err)
   }
+}
+
+// After the AI quotes a price (its reply mentions "R$"), offer the same follow-up
+// buttons the guided menu shows — so the customer can close, browse another
+// product, or ask for a human, whether they got here by typing or by tapping.
+function offersOrderButtons(chatId: string): Promise<{ ok: boolean; status: number; data: unknown }> {
+  return sendButtons(chatId, 'Posso seguir com esse pedido?', [
+    { id: 'wiz|close', title: '✅ Fechar pedido' },
+    { id: 'wiz|backcat', title: '🔁 Outro produto' },
+    { id: 'wiz|human', title: '💬 Falar com equipe' },
+  ])
 }
 
 // --- AI auto-reply ---
@@ -643,7 +660,13 @@ async function handleWithAI(chatId: string, wamid: string, userText: string, ts:
     if (!replyText) return
 
     const result = await sendText(chatId, replyText, wamid)
-    if (!result.ok) console.error('ai: send failed:', result.data)
+    if (!result.ok) {
+      console.error('ai: send failed:', result.data)
+    } else if (/R\$\s?\d/.test(replyText)) {
+      // The reply quotes a price — offer the same close/browse/human buttons the
+      // guided menu shows, so the customer doesn't have to type "pedido" to get them.
+      await offersOrderButtons(chatId)
+    }
   } catch (err) {
     console.error('ai: handling failed:', err)
   }
