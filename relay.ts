@@ -44,7 +44,7 @@ const START = Date.now()
 
 // --- AI assistant setup ---
 
-const AI_MODEL = 'claude-sonnet-5'
+const AI_MODEL = 'claude-haiku-4-5-20251001'
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY })
 
 const AI_INSTRUCTIONS = readFileSync(new URL('./instrucoes.md', import.meta.url), 'utf8')
