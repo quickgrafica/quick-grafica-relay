@@ -175,6 +175,46 @@ const AI_TOOLS: Anthropic.Messages.Tool[] = [
       required: ['termo'],
     },
   },
+  {
+    name: 'mostrar_opcoes',
+    description:
+      'Envia uma pergunta com opções clicáveis pro cliente (vira botões se forem até 3, ou uma lista se forem 4 a 10) — em vez de escrever a pergunta e as opções como texto/lista numerada. Use sempre que for pedir pro cliente escolher entre 2 ou mais opções (tamanho, papel, acabamento, etc). Depois de chamar essa ferramenta pare — não escreva mais nenhum texto, a pergunta já foi enviada pra ele. Se só houver 1 opção possível (não é escolha), responda em texto normal em vez de usar essa ferramenta.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        pergunta: {
+          type: 'string',
+          description: 'Pergunta curta que introduz as opções, ex: "Qual tamanho você prefere?"',
+        },
+        opcoes: {
+          type: 'array',
+          minItems: 2,
+          maxItems: 10,
+          items: {
+            type: 'object',
+            properties: {
+              titulo: {
+                type: 'string',
+                description: 'Texto curto do botão/opção, até 24 caracteres, ex: "10x15cm" ou "Papel Kraft"',
+              },
+              descricao: {
+                type: 'string',
+                description: 'Detalhe extra opcional (só aparece quando vira lista, com 4+ opções), ex: "Couchê 90g, 4x0 — R$ 400,00"',
+              },
+              valor: {
+                type: 'string',
+                description:
+                  'Texto completo dessa escolha, como se o cliente tivesse digitado (inclua tamanho/papel/acabamento e preço se souber) — é isso que volta pra você quando o cliente clicar aqui.',
+              },
+            },
+            required: ['titulo', 'valor'],
+          },
+          description: 'Lista de 2 a 10 opções pro cliente escolher clicando.',
+        },
+      },
+      required: ['pergunta', 'opcoes'],
+    },
+  },
 ]
 
 const AI_SYSTEM: Anthropic.Messages.TextBlockParam[] = [
@@ -390,6 +430,11 @@ function isOrderTrigger(text: string): boolean {
   return ORDER_TRIGGERS.has(normalize(text.trim()))
 }
 
+// Holds the last set of AI-generated options offered to each chat (see the
+// `mostrar_opcoes` tool below), so a tap on one can be resolved back to its
+// full text and fed into the AI flow as if the customer had typed it.
+const pendingOptions = new Map<string, string[]>()
+
 const CATEGORIES = [...new Set(CATALOG_ENTRIES.map((e) => e.category))]
 
 function subcategoriesOf(cat: string): string[] {
@@ -549,6 +594,22 @@ async function handleWizardTap(chatId: string, id: string, replyTo?: string): Pr
       logMessage({ direction: 'in', chatId, text: '⭐ Cliente quer fechar o pedido (confirmar pelos bastidores)', timestamp: Date.now() })
       return
     }
+    if (id.startsWith('wiz|opt|')) {
+      // Customer tapped one of the AI's own buttons/list (from `mostrar_opcoes`).
+      // Resolve it back to full text and continue the AI flow as if they'd typed it —
+      // this is what lets the AI ask one question at a time (tamanho → papel → ...).
+      const i = Number(id.split('|')[2])
+      const value = pendingOptions.get(chatId)?.[i]
+      if (!value) {
+        await sendText(chatId, 'Essa opção já expirou — pode me dizer de novo o que você precisa? 🙂', replyTo)
+        return
+      }
+      pendingOptions.delete(chatId)
+      const ts = Date.now()
+      logMessage({ direction: 'in', chatId, text: value, timestamp: ts })
+      await handleWithAI(chatId, replyTo ?? '', value, ts)
+      return
+    }
   } catch (err) {
     console.error('wizard: handling failed:', err)
   }
@@ -563,6 +624,55 @@ function offersOrderButtons(chatId: string): Promise<{ ok: boolean; status: numb
     { id: 'wiz|backcat', title: '🔁 Outro produto' },
     { id: 'wiz|human', title: '💬 Falar com equipe' },
   ])
+}
+
+// Executes the AI's `mostrar_opcoes` tool call: sends the question as buttons (≤3
+// options) or a list (4-10), and remembers the full "valor" text behind each one so
+// a tap can be resolved back to it (see the `wiz|opt|` branch in handleWizardTap).
+async function sendAiOptions(
+  chatId: string,
+  input: unknown,
+  replyTo?: string,
+): Promise<void> {
+  const data = input as { pergunta?: unknown; opcoes?: unknown }
+  const pergunta = typeof data.pergunta === 'string' ? data.pergunta : 'Qual dessas opções você prefere?'
+  const rawOpcoes = Array.isArray(data.opcoes) ? data.opcoes : []
+  const opcoes = rawOpcoes
+    .filter((o): o is { titulo: unknown; descricao?: unknown; valor: unknown } => typeof o === 'object' && o !== null)
+    .map((o) => ({
+      titulo: typeof o.titulo === 'string' && o.titulo ? o.titulo : 'Opção',
+      descricao: typeof o.descricao === 'string' ? o.descricao : undefined,
+      valor: typeof o.valor === 'string' && o.valor ? o.valor : String(o.titulo ?? 'opção'),
+    }))
+    .slice(0, 10)
+
+  if (opcoes.length === 0) return
+
+  pendingOptions.set(chatId, opcoes.map((o) => o.valor))
+
+  if (opcoes.length <= 3) {
+    await sendButtons(
+      chatId,
+      pergunta,
+      opcoes.map((o, i) => ({ id: `wiz|opt|${i}`, title: o.titulo })),
+      replyTo,
+    )
+  } else {
+    await sendList(
+      chatId,
+      {
+        body: pergunta,
+        buttonText: 'Ver opções',
+        sections: [
+          {
+            title: 'Opções',
+            rows: opcoes.map((o, i) => ({ id: `wiz|opt|${i}`, title: o.titulo, description: o.descricao })),
+          },
+        ],
+      },
+      replyTo,
+    )
+  }
 }
 
 // --- AI auto-reply ---
@@ -641,6 +751,15 @@ async function handleWithAI(chatId: string, wamid: string, userText: string, ts:
           .join('\n')
           .trim()
         break
+      }
+
+      // `mostrar_opcoes` sends its own WhatsApp message (buttons/list) and ends the
+      // turn — the customer needs to tap before we continue, so stop here instead
+      // of looping back to the model.
+      const showOptions = toolUses.find((tu) => tu.name === 'mostrar_opcoes')
+      if (showOptions) {
+        await sendAiOptions(chatId, showOptions.input, wamid)
+        return
       }
 
       messages.push({ role: 'assistant', content: response.content })
