@@ -178,8 +178,8 @@ const AI_TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: 'mostrar_opcoes',
     description:
-      'Envia uma pergunta com opções clicáveis pro cliente (vira botões se forem até 3, ou uma lista se forem 4 a 10) — em vez de escrever a pergunta e as opções como texto/lista numerada. Use sempre que for pedir pro cliente escolher entre 2 ou mais opções (tamanho, papel, acabamento, etc). Depois de chamar essa ferramenta pare — não escreva mais nenhum texto, a pergunta já foi enviada pra ele. Se só houver 1 opção possível (não é escolha), responda em texto normal em vez de usar essa ferramenta.',
-    input_schema: {
+      'Envia uma pergunta com opções clicáveis pro cliente (vira botões se forem até 3, ou uma lista se forem 4 a 10) — em vez de escrever a pergunta e as opções como texto/lista numerada. Use sempre que for pedir pro cliente escolher entre 2 ou mais opções (tamanho, papel, acabamento, etc). Depois de chamar essa ferramenta pare — não escreva mais nenhum texto, a pergunta já foi enviada pra ele. Se só houver 1 opção possível (não é escolha), responda em texto normal em vez de usar essa ferramenta. IMPORTANTE: as opções têm que vir literalmente do que `buscar_catalogo` retornou pra esse produto (a linha "Opções:", ou variações distintas do mesmo produto) — nunca invente uma variação (tipo, cor, lado de impressão, etc) que não apareceu na busca, mesmo que pareça óbvia pra esse tipo de produto.',
+      nput_schema: {
       type: 'object',
       properties: {
         pergunta: {
