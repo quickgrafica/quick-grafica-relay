@@ -9,7 +9,8 @@
   },
   "dependencies": {
     "hono": "^4",
-    "@hono/node-server": "^1"
+    "@hono/node-server": "^1",
+    "@anthropic-ai/sdk": "^0.122"
   },
   "devDependencies": {
     "typescript": "^5",
