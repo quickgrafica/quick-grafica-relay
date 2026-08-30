@@ -1087,6 +1087,23 @@ app.get('/log', (c) => {
   return c.json({ log })
 })
 
+// Lets the dashboard reply to a customer as the business. Gated by the same
+// DASHBOARD_TOKEN as the rest of the dashboard (not RELAY_SECRET) — anyone who
+// can see the conversations can reply to them, and the two tokens stay
+// independent in case DASHBOARD_TOKEN is ever set to something separate.
+app.post('/dashboard-send', async (c) => {
+  if (c.req.query('token') !== DASHBOARD_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+
+  const { to, text } = await c.req.json<{ to: string; text: string }>()
+  if (!to || !text?.trim()) return c.json({ error: 'to e text são obrigatórios' }, 400)
+
+  const result = await sendText(to, text.trim())
+  if (!result.ok) return c.json({ error: result.data }, result.status as ContentfulStatusCode)
+
+  const wamid = (result.data as { messages?: Array<{ id: string }> }).messages?.[0]?.id
+  return c.json({ wamid })
+})
+
 // Simple mobile-friendly page that polls /log and renders it as chat bubbles per contact.
 app.get('/dashboard', (c) => {
   if (c.req.query('token') !== DASHBOARD_TOKEN) return c.text('Forbidden — adicione ?token=SEU_TOKEN na URL.', 401)
@@ -1109,12 +1126,19 @@ app.get('/dashboard', (c) => {
   .contact:hover, .contact.active { background: #f0f0f0; }
   .contact .name { font-weight: 600; font-size: 14px; }
   .contact .preview { font-size: 12px; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #chat-panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #chat { flex: 1; overflow-y: auto; padding: 16px; }
   .bubble { max-width: 70%; padding: 8px 12px; border-radius: 8px; margin-bottom: 8px; font-size: 14px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
   .bubble.in { background: #fff; margin-right: auto; }
   .bubble.out { background: #d9fdd3; margin-left: auto; }
   .bubble .meta { font-size: 10px; color: #888; margin-top: 4px; text-align: right; }
   #empty { padding: 40px; text-align: center; color: #888; }
+  #composer { display: none; gap: 8px; padding: 10px; background: #f0f0f0; border-top: 1px solid #ddd; }
+  #composer.visible { display: flex; }
+  #msgInput { flex: 1; padding: 10px 12px; border-radius: 20px; border: 1px solid #ccc; font-size: 14px; font-family: inherit; outline: none; }
+  #sendBtn { padding: 0 18px; border-radius: 20px; border: none; background: #075e54; color: #fff; font-size: 14px; cursor: pointer; }
+  #sendBtn:disabled { opacity: 0.5; cursor: default; }
+  #sendError { color: #c0392b; font-size: 12px; padding: 0 12px 8px; }
   @media (prefers-color-scheme: dark) {
     body { background: #0b141a; color: #eee; }
     #contacts { background: #111b21; border-color: #222; }
@@ -1123,6 +1147,8 @@ app.get('/dashboard', (c) => {
     .contact .preview { color: #999; }
     .bubble.in { background: #1f2c33; }
     .bubble.out { background: #005c4b; }
+    #composer { background: #111b21; border-color: #222; }
+    #msgInput { background: #1f2c33; border-color: #333; color: #eee; }
   }
 </style>
 </head>
@@ -1133,7 +1159,14 @@ app.get('/dashboard', (c) => {
 </header>
 <div id="layout">
   <div id="contacts"></div>
-  <div id="chat"><div id="empty">Selecione uma conversa</div></div>
+  <div id="chat-panel">
+    <div id="chat"><div id="empty">Selecione uma conversa</div></div>
+    <div id="sendError"></div>
+    <div id="composer">
+      <input id="msgInput" type="text" placeholder="Digite uma mensagem..." autocomplete="off">
+      <button id="sendBtn">Enviar</button>
+    </div>
+  </div>
 </div>
 <script>
 const TOKEN = ${JSON.stringify(token)};
@@ -1175,9 +1208,12 @@ function render(log) {
     const div = document.createElement('div');
     div.className = 'contact' + (id === selected ? ' active' : '');
     div.innerHTML = '<div class="name">' + escapeHtml(name) + '</div><div class="preview">' + escapeHtml(last.text || '') + '</div>';
-    div.onclick = () => { selected = id; lastLen = 0; render(log); };
+    div.onclick = () => { selected = id; lastLen = 0; document.getElementById('sendError').textContent = ''; render(log); };
     contactsEl.appendChild(div);
   }
+
+  const composerEl = document.getElementById('composer');
+  composerEl.classList.toggle('visible', !!selected);
 
   const chatEl = document.getElementById('chat');
   if (!selected) { chatEl.innerHTML = '<div id="empty">Nenhuma conversa ainda</div>'; return; }
@@ -1198,6 +1234,46 @@ function render(log) {
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+
+const msgInput = document.getElementById('msgInput');
+const sendBtn = document.getElementById('sendBtn');
+const sendErrorEl = document.getElementById('sendError');
+
+async function sendMessage() {
+  const text = msgInput.value.trim();
+  if (!text || !selected) return;
+
+  sendBtn.disabled = true;
+  msgInput.disabled = true;
+  sendErrorEl.textContent = '';
+
+  try {
+    const res = await fetch('/dashboard-send?token=' + encodeURIComponent(TOKEN), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: selected, text }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      sendErrorEl.textContent = 'Falha ao enviar: ' + (body.error ? JSON.stringify(body.error) : res.status);
+    } else {
+      msgInput.value = '';
+      lastLen = 0; // force the next tick to re-render this chat with the message we just sent
+      tick();
+    }
+  } catch (e) {
+    sendErrorEl.textContent = 'Sem conexão — tente de novo.';
+  } finally {
+    sendBtn.disabled = false;
+    msgInput.disabled = false;
+    msgInput.focus();
+  }
+}
+
+sendBtn.onclick = sendMessage;
+msgInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
+});
 
 tick();
 setInterval(tick, 4000);
