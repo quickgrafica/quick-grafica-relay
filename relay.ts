@@ -1,0 +1,1297 @@
+import { Hono } from 'hono'
+import type { ContentfulStatusCode } from 'hono/utils/http-status'
+import { serve } from '@hono/node-server'
+import { createHmac, timingSafeEqual } from 'node:crypto'
+import { readFileSync, writeFileSync } from 'node:fs'
+import Anthropic from '@anthropic-ai/sdk'
+
+// Load .env — real env wins.
+try {
+  for (const line of readFileSync('.env', 'utf8').split(/\r?\n/)) {
+    const m = line.match(/^(\w+)=(.*)$/)
+    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
+  }
+} catch {}
+
+// --- Env validation ---
+
+const required = [
+  'WHATSAPP_ACCESS_TOKEN',
+  'WHATSAPP_PHONE_NUMBER_ID',
+  'WHATSAPP_VERIFY_TOKEN',
+  'WHATSAPP_APP_SECRET',
+  'RELAY_SECRET',
+  'ANTHROPIC_API_KEY',
+] as const
+
+for (const key of required) {
+  if (!process.env[key]) {
+    console.error(`missing required env var: ${key}`)
+    process.exit(1)
+  }
+}
+
+const ACCESS_TOKEN = process.env.WHATSAPP_ACCESS_TOKEN!
+const PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID!
+const VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN!
+const APP_SECRET = process.env.WHATSAPP_APP_SECRET!
+const RELAY_SECRET = process.env.RELAY_SECRET!
+const DASHBOARD_TOKEN = process.env.DASHBOARD_TOKEN || RELAY_SECRET
+const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY!
+const PORT = Number(process.env.PORT ?? 3000)
+const WA_API = `https://graph.facebook.com/v21.0/${PHONE_NUMBER_ID}`
+const START = Date.now()
+
+// --- AI assistant setup ---
+
+const AI_MODEL = 'claude-haiku-4-5-20251001'
+const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY })
+
+const AI_INSTRUCTIONS = readFileSync(new URL('./instrucoes.md', import.meta.url), 'utf8')
+const AI_CATALOG = readFileSync(new URL('./catalogo.md', import.meta.url), 'utf8')
+
+// --- Catalog parsing & search ---
+//
+// Sending the full ~275KB catalog as context on every single message is what
+// was driving the API cost up — even with caching, sporadic WhatsApp traffic
+// means the cache keeps expiring between customer messages, so most messages
+// were re-paying to reprocess all 703 products. Instead we parse the catalog
+// once at startup and give the AI a search tool: it only pays for the few
+// products actually relevant to each question.
+
+interface CatalogEntry {
+  category: string
+  subcategory: string
+  heading: string
+  body: string
+}
+
+function parseCatalog(text: string): CatalogEntry[] {
+  const entries: CatalogEntry[] = []
+  let category = ''
+  let subcategory = ''
+  let current: CatalogEntry | null = null
+
+  for (const line of text.split('\n')) {
+    if (line.startsWith('#### Subcategoria:')) {
+      subcategory = line.replace('#### Subcategoria:', '').trim()
+      current = null
+    } else if (line.startsWith('### ')) {
+      current = { category, subcategory, heading: line.replace(/^###\s*/, '').trim(), body: '' }
+      entries.push(current)
+    } else if (line.startsWith('## ')) {
+      category = line.replace(/^##\s*/, '').trim()
+      current = null
+    } else if (line.startsWith('#')) {
+      current = null
+    } else if (current) {
+      current.body += (current.body ? '\n' : '') + line
+    }
+  }
+
+  return entries
+}
+
+const CATALOG_ENTRIES = parseCatalog(AI_CATALOG)
+
+// Compact overview (categories + subcategories only) so the AI knows what
+// exists without paying for the full product list.
+const CATALOG_OVERVIEW = (() => {
+  const byCategory = new Map<string, Set<string>>()
+  for (const e of CATALOG_ENTRIES) {
+    if (!byCategory.has(e.category)) byCategory.set(e.category, new Set())
+    if (e.subcategory) byCategory.get(e.category)!.add(e.subcategory)
+  }
+  const lines: string[] = []
+  for (const [cat, subs] of byCategory) {
+    lines.push(`- ${cat}: ${[...subs].join(', ')}`)
+  }
+  return lines.join('\n')
+})()
+
+function normalize(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+}
+
+const MAX_SEARCH_RESULTS = 8
+const MAX_SEARCH_CHARS = 6000
+
+function searchCatalog(query: string): string {
+  const words = normalize(query).split(/\s+/).filter(Boolean)
+  if (words.length === 0) return 'Termo de busca vazio.'
+
+  const scored = CATALOG_ENTRIES.map((e) => {
+    // Weight matches in the product name / category much higher than a
+    // stray mention buried in some other product's options list — otherwise
+    // e.g. searching "botton" surfaces unrelated products that happen to
+    // list "+2 bottons" as an accessory add-on, burying the actual Botton
+    // products under ties.
+    const heading = normalize(`${e.category} ${e.subcategory} ${e.heading}`)
+    const body = normalize(e.body)
+    let score = 0
+    for (const w of words) {
+      if (heading.includes(w)) score += 5
+      // Count repeated body mentions too (relevant products tend to repeat
+      // the term across variations/tiers), but cap so one huge options list
+      // can't out-rank a real heading match.
+      const bodyHits = body.split(w).length - 1
+      score += Math.min(bodyHits, 3)
+    }
+    return { e, score }
+  })
+    .filter((r) => r.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, MAX_SEARCH_RESULTS)
+
+  if (scored.length === 0) {
+    return `Nenhum produto encontrado para "${query}". Tente outra palavra-chave (nome do produto, categoria ou material).`
+  }
+
+  let out = ''
+  for (const { e } of scored) {
+    const block = `### ${e.heading} [${e.category} / ${e.subcategory}]\n${e.body.trim()}\n\n`
+    if (out.length + block.length > MAX_SEARCH_CHARS) break
+    out += block
+  }
+  return out.trim()
+}
+
+const AI_TOOLS: Anthropic.Messages.Tool[] = [
+  {
+    name: 'buscar_catalogo',
+    description:
+      'Busca produtos no catálogo da Quick Gráfica por palavra-chave (nome do produto, categoria, material, acabamento). Retorna os produtos mais relevantes com preço, formato, material e opções. Use sempre que precisar do preço ou detalhes de um produto — você não tem o catálogo completo na memória.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        termo: {
+          type: 'string',
+          description: 'Palavra-chave de busca, ex: "cartao de visita", "adesivo redondo", "banner lona"',
+        },
+      },
+      required: ['termo'],
+    },
+  },
+  {
+    name: 'mostrar_opcoes',
+    description:
+      'Envia uma pergunta com opções clicáveis pro cliente (vira botões se forem até 3, ou uma lista se forem 4 a 10) — em vez de escrever a pergunta e as opções como texto/lista numerada. Use sempre que for pedir pro cliente escolher entre 2 ou mais opções (tamanho, papel, acabamento, etc). Depois de chamar essa ferramenta pare — não escreva mais nenhum texto, a pergunta já foi enviada pra ele. Se só houver 1 opção possível (não é escolha), responda em texto normal em vez de usar essa ferramenta. IMPORTANTE: as opções têm que vir literalmente do que `buscar_catalogo` retornou pra esse produto (a linha "Opções:", ou variações distintas do mesmo produto) — nunca invente uma variação (tipo, cor, lado de impressão, etc) que não apareceu na busca, mesmo que pareça óbvia pra esse tipo de produto.',
+      input_schema: {
+      type: 'object',
+      properties: {
+        pergunta: {
+          type: 'string',
+          description: 'Pergunta curta que introduz as opções, ex: "Qual tamanho você prefere?"',
+        },
+        opcoes: {
+          type: 'array',
+          minItems: 2,
+          maxItems: 10,
+          items: {
+            type: 'object',
+            properties: {
+              titulo: {
+                type: 'string',
+                description: 'Texto curto do botão/opção, até 24 caracteres, ex: "10x15cm" ou "Papel Kraft"',
+              },
+              descricao: {
+                type: 'string',
+                description: 'Detalhe extra opcional (só aparece quando vira lista, com 4+ opções), ex: "Couchê 90g, 4x0 — R$ 400,00"',
+              },
+              valor: {
+                type: 'string',
+                description:
+                  'Texto completo dessa escolha, como se o cliente tivesse digitado (inclua tamanho/papel/acabamento e preço se souber) — é isso que volta pra você quando o cliente clicar aqui.',
+              },
+            },
+            required: ['titulo', 'valor'],
+          },
+          description: 'Lista de 2 a 10 opções pro cliente escolher clicando.',
+        },
+      },
+      required: ['pergunta', 'opcoes'],
+    },
+  },
+]
+
+const AI_SYSTEM: Anthropic.Messages.TextBlockParam[] = [
+  { type: 'text', text: AI_INSTRUCTIONS },
+  {
+    type: 'text',
+    text: `Categorias e subcategorias disponíveis no catálogo:\n${CATALOG_OVERVIEW}`,
+    cache_control: { type: 'ephemeral', ttl: '1h' },
+  },
+]
+
+// --- Queue ---
+
+interface InboundMessage {
+  id: number
+  timestamp: number
+  wamid: string
+  from: string
+  pushName: string
+  type: string
+  text?: string
+  mediaId?: string
+  mimeType?: string
+  filename?: string
+  latitude?: number
+  longitude?: number
+  reactionEmoji?: string
+  reactionTargetWamid?: string
+}
+
+let queue: InboundMessage[] = []
+let nextId = 1
+const MAX_QUEUE = 1000
+
+function enqueue(msg: Omit<InboundMessage, 'id' | 'timestamp'>): void {
+  queue.push({ ...msg, id: nextId++, timestamp: Date.now() })
+  if (queue.length > MAX_QUEUE) {
+    queue = queue.slice(queue.length - MAX_QUEUE)
+  }
+}
+
+// --- Conversation log (persisted to disk, for the /dashboard viewer) ---
+
+interface LogEntry {
+  direction: 'in' | 'out'
+  chatId: string
+  pushName?: string
+  text: string
+  timestamp: number
+  wamid?: string
+}
+
+const LOG_FILE = `${process.env.DATA_DIR ?? '.'}/conversas.json`
+const MAX_LOG = 2000
+
+let log: LogEntry[] = []
+try {
+  log = JSON.parse(readFileSync(LOG_FILE, 'utf8'))
+} catch {}
+
+function logMessage(entry: LogEntry): void {
+  log.push(entry)
+  if (log.length > MAX_LOG) {
+    log = log.slice(log.length - MAX_LOG)
+  }
+  try {
+    writeFileSync(LOG_FILE, JSON.stringify(log))
+  } catch (err) {
+    console.error('log: failed to persist conversas.json:', err)
+  }
+}
+
+// --- Signature validation ---
+
+function verifySignature(rawBody: string, header: string | undefined): boolean {
+  if (!header) return false
+  const sig = header.replace('sha256=', '')
+  if (!sig) return false
+  const expected = createHmac('sha256', APP_SECRET).update(rawBody).digest('hex')
+  if (sig.length !== expected.length) return false
+  return timingSafeEqual(Buffer.from(sig), Buffer.from(expected))
+}
+
+// --- WhatsApp API helper ---
+
+async function waApi(
+  path: string,
+  body: Record<string, unknown>,
+): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const res = await fetch(`${WA_API}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${ACCESS_TOKEN}`,
+    },
+    body: JSON.stringify(body),
+  })
+  const data = await res.json()
+  return { ok: res.ok, status: res.status, data }
+}
+
+// --- Outbound send helper (shared by /send and the AI auto-reply) ---
+
+async function sendText(
+  to: string,
+  text: string,
+  replyTo?: string,
+): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const body: Record<string, unknown> = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'text',
+    text: { body: text },
+  }
+  if (replyTo) body.context = { message_id: replyTo }
+
+  const result = await waApi('/messages', body)
+  if (result.ok) {
+    const wamid = (result.data as { messages?: Array<{ id: string }> }).messages?.[0]?.id
+    logMessage({ direction: 'out', chatId: to, text, timestamp: Date.now(), wamid })
+  }
+  return result
+}
+
+// Sends up to 3 quick-reply buttons attached to a message.
+async function sendButtons(
+  to: string,
+  body: string,
+  buttons: Array<{ id: string; title: string }>,
+  replyTo?: string,
+): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const waButtons = buttons
+    .slice(0, 3)
+    .map((b) => ({ type: 'reply' as const, reply: { id: b.id, title: b.title.slice(0, 20) } }))
+
+  const msgBody: Record<string, unknown> = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: { type: 'button', body: { text: body }, action: { buttons: waButtons } },
+  }
+  if (replyTo) msgBody.context = { message_id: replyTo }
+
+  const result = await waApi('/messages', msgBody)
+  if (result.ok) {
+    const wamid = (result.data as { messages?: Array<{ id: string }> }).messages?.[0]?.id
+    const summary = `${body}\n${waButtons.map((b) => `[${b.reply.title}]`).join(' ')}`
+    logMessage({ direction: 'out', chatId: to, text: summary, timestamp: Date.now(), wamid })
+  }
+  return result
+}
+
+interface ListRow {
+  id: string
+  title: string
+  description?: string
+}
+interface ListSection {
+  title: string
+  rows: ListRow[]
+}
+
+// Sends a WhatsApp list message (tap the button to open up to 10 rows total).
+async function sendList(
+  to: string,
+  opts: { header?: string; body: string; footer?: string; buttonText: string; sections: ListSection[] },
+  replyTo?: string,
+): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const msgBody: Record<string, unknown> = {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'interactive',
+    interactive: {
+      type: 'list',
+      ...(opts.header ? { header: { type: 'text', text: opts.header.slice(0, 60) } } : {}),
+      body: { text: opts.body },
+      ...(opts.footer ? { footer: { text: opts.footer.slice(0, 60) } } : {}),
+      action: {
+        button: opts.buttonText.slice(0, 20),
+        sections: opts.sections.map((s) => ({
+          title: s.title.slice(0, 24),
+          rows: s.rows.map((r) => ({
+            id: r.id,
+            title: r.title.slice(0, 24),
+            ...(r.description ? { description: r.description.slice(0, 72) } : {}),
+          })),
+        })),
+      },
+    },
+  }
+  if (replyTo) msgBody.context = { message_id: replyTo }
+
+  const result = await waApi('/messages', msgBody)
+  if (result.ok) {
+    const wamid = (result.data as { messages?: Array<{ id: string }> }).messages?.[0]?.id
+    const summary = `${opts.body}\n${opts.sections.flatMap((s) => s.rows.map((r) => `• ${r.title}`)).join('\n')}`
+    logMessage({ direction: 'out', chatId: to, text: summary, timestamp: Date.now(), wamid })
+  }
+  return result
+}
+
+// --- Order wizard (guided category → subcategory → product menu via buttons/lists) ---
+//
+// This is pure navigation, driven by the catalog index we already built for AI search —
+// no AI call, no tokens spent, until the customer lands on one exact product. At that
+// point we hand off to the normal AI flow (which already knows to re-search before
+// quoting a price) by just sending the product's full details as a plain message, the
+// same way a human would type it — the AI picks up from there on the customer's next reply.
+
+const ORDER_TRIGGERS = new Set(['pedido', 'fazer pedido', 'menu', 'catalogo', 'ver produtos', 'ver catalogo'])
+
+function isOrderTrigger(text: string): boolean {
+  return ORDER_TRIGGERS.has(normalize(text.trim()))
+}
+
+// Holds the last set of AI-generated options offered to each chat (see the
+// `mostrar_opcoes` tool below), so a tap on one can be resolved back to its
+// full text and fed into the AI flow as if the customer had typed it.
+const pendingOptions = new Map<string, string[]>()
+
+const CATEGORIES = [...new Set(CATALOG_ENTRIES.map((e) => e.category))]
+
+function subcategoriesOf(cat: string): string[] {
+  return [...new Set(CATALOG_ENTRIES.filter((e) => e.category === cat && e.subcategory).map((e) => e.subcategory))]
+}
+
+function entriesOf(cat: string, sub: string): Array<{ e: CatalogEntry; i: number }> {
+  return CATALOG_ENTRIES.map((e, i) => ({ e, i })).filter(({ e }) => e.category === cat && (e.subcategory || '') === sub)
+}
+
+function slugToLabel(s: string): string {
+  const minor = new Set(['e', 'de', 'da', 'do', 'das', 'dos'])
+  return s
+    .split('-')
+    .map((w, i) => (i > 0 && minor.has(w) ? w : w.charAt(0).toUpperCase() + w.slice(1)))
+    .join(' ')
+}
+
+function shortDesc(body: string): string {
+  const firstLine = body.split('\n')[0] ?? ''
+  return firstLine.replace(/^-\s*/, '').slice(0, 72)
+}
+
+// Many catalog entries share the same product name and are only told apart by a short
+// code in parentheses at the end (e.g. "Adesivo Vinil Metro Quadrado (0129570E)"). A plain
+// 24-char slice would cut that code off and leave several rows looking identical, so keep
+// the code visible and trim the descriptive part instead.
+function rowTitle(heading: string): string {
+  const m = heading.match(/^(.*?)\s*\(([0-9A-F]{6,8})\)\s*$/)
+  if (m) {
+    const room = Math.max(24 - (m[2].length + 3), 1)
+    return `${m[1].slice(0, room)} (${m[2]})`.slice(0, 24)
+  }
+  return heading.slice(0, 24)
+}
+
+const WIZ_PAGE_TOP = 9 // top-level list: leaves room for 1 "more" row (10 rows max total)
+const WIZ_PAGE_SUB = 8 // nested lists: leaves room for "more" + "back" rows
+
+function paginate<T>(items: T[], p: number, size: number): { items: T[]; hasMore: boolean } {
+  const start = p * size
+  return { items: items.slice(start, start + size), hasMore: items.length > start + size }
+}
+
+async function sendCategoryList(chatId: string, p: number, replyTo?: string): Promise<void> {
+  const { items, hasMore } = paginate(CATEGORIES, p, WIZ_PAGE_TOP)
+  const rows: ListRow[] = items.map((cat) => ({ id: `wiz|cat|${cat}`, title: slugToLabel(cat).slice(0, 24) }))
+  if (hasMore) rows.push({ id: `wiz|catmore|${p + 1}`, title: '➡️ Ver mais opções' })
+  await sendList(
+    chatId,
+    {
+      header: 'Fazer pedido',
+      body: 'Escolha uma categoria:',
+      buttonText: 'Categorias',
+      sections: [{ title: 'Categorias', rows }],
+    },
+    replyTo,
+  )
+}
+
+async function sendSubcategoryList(chatId: string, cat: string, p: number, replyTo?: string): Promise<void> {
+  const { items, hasMore } = paginate(subcategoriesOf(cat), p, WIZ_PAGE_SUB)
+  const rows: ListRow[] = items.map((sub) => ({ id: `wiz|sub|${cat}|${sub}`, title: slugToLabel(sub).slice(0, 24) }))
+  if (hasMore) rows.push({ id: `wiz|submore|${cat}|${p + 1}`, title: '➡️ Ver mais opções' })
+  rows.push({ id: 'wiz|backcat', title: '🔙 Voltar' })
+  await sendList(
+    chatId,
+    {
+      header: slugToLabel(cat),
+      body: 'Escolha uma subcategoria:',
+      buttonText: 'Subcategorias',
+      sections: [{ title: 'Subcategorias', rows }],
+    },
+    replyTo,
+  )
+}
+
+async function sendProductList(chatId: string, cat: string, sub: string, p: number, replyTo?: string): Promise<void> {
+  const { items, hasMore } = paginate(entriesOf(cat, sub), p, WIZ_PAGE_SUB)
+  const rows: ListRow[] = items.map(({ e, i }) => ({
+    id: `wiz|prod|${i}`,
+    title: rowTitle(e.heading),
+    description: shortDesc(e.body),
+  }))
+  if (hasMore) rows.push({ id: `wiz|prodmore|${cat}|${sub}|${p + 1}`, title: '➡️ Ver mais opções' })
+  rows.push({ id: sub ? `wiz|backsub|${cat}` : 'wiz|backcat', title: '🔙 Voltar' })
+  await sendList(
+    chatId,
+    {
+      header: slugToLabel(sub || cat),
+      body: 'Escolha um produto:',
+      buttonText: 'Produtos',
+      sections: [{ title: 'Produtos', rows }],
+    },
+    replyTo,
+  )
+}
+
+async function handleWizardTap(chatId: string, id: string, replyTo?: string, pushName?: string): Promise<void> {
+  try {
+    if (id === 'wiz|start' || id === 'wiz|backcat') {
+      await sendCategoryList(chatId, 0, replyTo)
+      return
+    }
+    if (id.startsWith('wiz|catmore|')) {
+      await sendCategoryList(chatId, Number(id.split('|')[2]) || 0, replyTo)
+      return
+    }
+    if (id.startsWith('wiz|cat|')) {
+      const cat = id.split('|')[2]
+      const subs = subcategoriesOf(cat)
+      if (subs.length === 0) await sendProductList(chatId, cat, '', 0, replyTo)
+      else await sendSubcategoryList(chatId, cat, 0, replyTo)
+      return
+    }
+    if (id.startsWith('wiz|backsub|')) {
+      await sendSubcategoryList(chatId, id.split('|')[2], 0, replyTo)
+      return
+    }
+    if (id.startsWith('wiz|submore|')) {
+      const [, , cat, p] = id.split('|')
+      await sendSubcategoryList(chatId, cat, Number(p) || 0, replyTo)
+      return
+    }
+    if (id.startsWith('wiz|sub|')) {
+      const [, , cat, sub] = id.split('|')
+      await sendProductList(chatId, cat, sub, 0, replyTo)
+      return
+    }
+    if (id.startsWith('wiz|prodmore|')) {
+      const [, , cat, sub, p] = id.split('|')
+      await sendProductList(chatId, cat, sub, Number(p) || 0, replyTo)
+      return
+    }
+    if (id.startsWith('wiz|prod|')) {
+      const idx = Number(id.split('|')[2])
+      const entry = CATALOG_ENTRIES[idx]
+      if (!entry) return
+      await sendText(
+        chatId,
+        `*${entry.heading}*\n${entry.body.trim()}\n\nQuantas unidades (ou m²) você quer? Me diz que já confirmo o valor certinho. 🙂`,
+        replyTo,
+      )
+      await sendButtons(chatId, 'Quer ver outro produto ou falar com a equipe?', [
+        { id: 'wiz|backcat', title: 'Outro produto' },
+        { id: 'wiz|human', title: 'Falar com equipe' },
+      ])
+      return
+    }
+    if (id === 'wiz|human') {
+      await sendText(chatId, 'Beleza! Pode me contar o que precisa que eu já te ajudo por aqui. 🙂', replyTo)
+      return
+    }
+    if (id === 'wiz|close') {
+      await sendText(chatId, 'Show! 🙌 Vou passar pra equipe confirmar os detalhes e o pagamento com você. Só um instante!', replyTo)
+      // Flagged in the log so the team can spot closing intents in the /dashboard.
+      logMessage({ direction: 'in', chatId, text: '⭐ Cliente quer fechar o pedido (confirmar pelos bastidores)', timestamp: Date.now() })
+      return
+    }
+    if (id.startsWith('wiz|opt|')) {
+      // Customer tapped one of the AI's own buttons/list (from `mostrar_opcoes`).
+      // Resolve it back to full text and continue the AI flow as if they'd typed it —
+      // this is what lets the AI ask one question at a time (tamanho → papel → ...).
+      const i = Number(id.split('|')[2])
+      const value = pendingOptions.get(chatId)?.[i]
+      if (!value) {
+        await sendText(chatId, 'Essa opção já expirou — pode me dizer de novo o que você precisa? 🙂', replyTo)
+        return
+      }
+      pendingOptions.delete(chatId)
+      const ts = Date.now()
+      logMessage({ direction: 'in', chatId, text: value, timestamp: ts })
+      await handleWithAI(chatId, replyTo ?? '', value, ts, pushName)
+      return
+    }
+  } catch (err) {
+    console.error('wizard: handling failed:', err)
+  }
+}
+
+// After the AI quotes a price (its reply mentions "R$"), offer the same follow-up
+// buttons the guided menu shows — so the customer can close, browse another
+// product, or ask for a human, whether they got here by typing or by tapping.
+function offersOrderButtons(chatId: string): Promise<{ ok: boolean; status: number; data: unknown }> {
+  return sendButtons(chatId, 'Posso seguir com esse pedido?', [
+    { id: 'wiz|close', title: '✅ Fechar pedido' },
+    { id: 'wiz|backcat', title: '🔁 Outro produto' },
+    { id: 'wiz|human', title: '💬 Falar com equipe' },
+  ])
+}
+
+// Executes the AI's `mostrar_opcoes` tool call: sends the question as buttons (≤3
+// options) or a list (4-10), and remembers the full "valor" text behind each one so
+// a tap can be resolved back to it (see the `wiz|opt|` branch in handleWizardTap).
+async function sendAiOptions(
+  chatId: string,
+  input: unknown,
+  replyTo?: string,
+): Promise<void> {
+  const data = input as { pergunta?: unknown; opcoes?: unknown }
+  const pergunta = typeof data.pergunta === 'string' ? data.pergunta : 'Qual dessas opções você prefere?'
+  const rawOpcoes = Array.isArray(data.opcoes) ? data.opcoes : []
+  const opcoes = rawOpcoes
+    .filter((o): o is { titulo: unknown; descricao?: unknown; valor: unknown } => typeof o === 'object' && o !== null)
+    .map((o) => ({
+      titulo: typeof o.titulo === 'string' && o.titulo ? o.titulo : 'Opção',
+      descricao: typeof o.descricao === 'string' ? o.descricao : undefined,
+      valor: typeof o.valor === 'string' && o.valor ? o.valor : String(o.titulo ?? 'opção'),
+    }))
+    .slice(0, 10)
+
+  if (opcoes.length === 0) return
+
+  pendingOptions.set(chatId, opcoes.map((o) => o.valor))
+
+  if (opcoes.length <= 3) {
+    await sendButtons(
+      chatId,
+      pergunta,
+      opcoes.map((o, i) => ({ id: `wiz|opt|${i}`, title: o.titulo })),
+      replyTo,
+    )
+  } else {
+    await sendList(
+      chatId,
+      {
+        body: pergunta,
+        buttonText: 'Ver opções',
+        sections: [
+          {
+            title: 'Opções',
+            rows: opcoes.map((o, i) => ({ id: `wiz|opt|${i}`, title: o.titulo, description: o.descricao })),
+          },
+        ],
+      },
+      replyTo,
+    )
+  }
+}
+
+// --- AI auto-reply ---
+//
+// Runs in-process, right when a message arrives — no separate always-on
+// worker needed, so it wakes together with the relay on Railway's free plan
+// (an idle worker with nothing hitting its own HTTP port would never wake up).
+
+const HISTORY_LIMIT = 20
+
+// Serializes handling per chat so two messages arriving close together don't
+// race each other's conversation history / replies. Returns the promise so
+// the webhook handler can await it — on Railway's free plan the container
+// can go back to sleep as soon as the HTTP response is sent, so any work
+// left running in the background after that point may never finish.
+const chatQueues = new Map<string, Promise<void>>()
+
+function enqueueForChat(chatId: string, task: () => Promise<void>): Promise<void> {
+  const prev = chatQueues.get(chatId) ?? Promise.resolve()
+  const next = prev.then(task).catch((err) => console.error('ai: task failed:', err))
+  chatQueues.set(chatId, next)
+  return next
+}
+
+// Avoids double-replying if Meta retries a webhook delivery (e.g. because our
+// response took a while while the AI was thinking).
+const processedForAI = new Set<string>()
+const MAX_PROCESSED_FOR_AI = 5000
+
+function buildHistory(chatId: string, beforeTs: number): Anthropic.Messages.MessageParam[] {
+  const entries = log.filter((e) => e.chatId === chatId && e.timestamp < beforeTs).slice(-HISTORY_LIMIT)
+  const collapsed: Anthropic.Messages.MessageParam[] = []
+  for (const e of entries) {
+    const role: 'user' | 'assistant' = e.direction === 'in' ? 'user' : 'assistant'
+    const last = collapsed[collapsed.length - 1]
+    if (last && last.role === role && typeof last.content === 'string') {
+      last.content = `${last.content}\n${e.text}`
+    } else {
+      collapsed.push({ role, content: e.text })
+    }
+  }
+  while (collapsed.length && collapsed[0].role !== 'user') collapsed.shift()
+  return collapsed
+}
+
+// Caps how many search-then-answer round trips a single reply can take —
+// just a safety net against the model looping, not a normal-case limit.
+const MAX_TOOL_ROUNDS = 4
+
+async function handleWithAI(chatId: string, wamid: string, userText: string, ts: number, pushName?: string): Promise<void> {
+  try {
+    const messages: Anthropic.Messages.MessageParam[] = [
+      ...buildHistory(chatId, ts),
+      { role: 'user', content: userText || '(mensagem vazia)' },
+    ]
+
+    // Adds the WhatsApp profile name (when we have one) as its own, uncached
+    // system block — placed after the cached instructions/catalog blocks so it
+    // varies per customer without invalidating that cache. Lets the assistant
+    // greet by name without having to ask for it on every conversation.
+    const system = pushName
+      ? [...AI_SYSTEM, { type: 'text' as const, text: `Nome do cliente (perfil do WhatsApp, pode não ser o nome que ele usa pra se apresentar): ${pushName}` }]
+      : AI_SYSTEM
+
+    let replyText = ''
+
+    for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const response = await anthropic.messages.create({
+        model: AI_MODEL,
+        max_tokens: 2048,
+        system,
+        tools: AI_TOOLS,
+        messages,
+      })
+
+      const toolUses = response.content.filter(
+        (b): b is Anthropic.Messages.ToolUseBlock => b.type === 'tool_use',
+      )
+
+      if (toolUses.length === 0) {
+        replyText = response.content
+          .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
+          .map((b) => b.text)
+          .join('\n')
+          .trim()
+        break
+      }
+
+      // `mostrar_opcoes` sends its own WhatsApp message (buttons/list) and ends the
+      // turn — the customer needs to tap before we continue, so stop here instead
+      // of looping back to the model.
+      const showOptions = toolUses.find((tu) => tu.name === 'mostrar_opcoes')
+      if (showOptions) {
+        await sendAiOptions(chatId, showOptions.input, wamid)
+        return
+      }
+
+      messages.push({ role: 'assistant', content: response.content })
+      messages.push({
+        role: 'user',
+        content: toolUses.map((tu) => {
+          const termo = typeof tu.input === 'object' && tu.input && 'termo' in tu.input ? String((tu.input as { termo: unknown }).termo) : ''
+          return {
+            type: 'tool_result' as const,
+            tool_use_id: tu.id,
+            content: searchCatalog(termo),
+          }
+        }),
+      })
+    }
+
+    if (!replyText) return
+
+    const result = await sendText(chatId, replyText, wamid)
+    if (!result.ok) {
+      console.error('ai: send failed:', result.data)
+    } else if (/R\$\s?\d/.test(replyText)) {
+      // The reply quotes a price — offer the same close/browse/human buttons the
+      // guided menu shows, so the customer doesn't have to type "pedido" to get them.
+      await offersOrderButtons(chatId)
+    }
+  } catch (err) {
+    console.error('ai: handling failed:', err)
+  }
+}
+
+// --- Webhook payload parsing ---
+
+interface WaMessage {
+  id: string
+  from: string
+  timestamp: string
+  type: string
+  text?: { body: string }
+  image?: { id: string; mime_type: string; caption?: string }
+  document?: { id: string; mime_type: string; filename?: string; caption?: string }
+  audio?: { id: string; mime_type: string }
+  video?: { id: string; mime_type: string; caption?: string }
+  voice?: { id: string; mime_type: string }
+  sticker?: { id: string; mime_type: string }
+  reaction?: { message_id: string; emoji: string }
+  location?: { latitude: number; longitude: number }
+  interactive?: {
+    type: string
+    button_reply?: { id: string; title: string }
+    list_reply?: { id: string; title: string; description?: string }
+  }
+}
+
+interface WaWebhookPayload {
+  object: string
+  entry?: Array<{
+    changes?: Array<{
+      value?: {
+        metadata?: { phone_number_id: string }
+        contacts?: Array<{ profile: { name: string }; wa_id: string }>
+        messages?: WaMessage[]
+      }
+    }>
+  }>
+}
+
+function parseMessages(payload: WaWebhookPayload): Promise<void>[] {
+  const pending: Promise<void>[] = []
+
+  for (const entry of payload.entry ?? []) {
+    for (const change of entry.changes ?? []) {
+      const value = change.value
+      if (!value?.messages) continue
+      if (value.metadata?.phone_number_id !== PHONE_NUMBER_ID) continue
+
+      const pushName = value.contacts?.[0]?.profile?.name ?? ''
+
+      for (const msg of value.messages) {
+        const base = { wamid: msg.id, from: msg.from, pushName, type: msg.type }
+        let logText = `(${msg.type})`
+
+        switch (msg.type) {
+          case 'text':
+            enqueue({ ...base, text: msg.text?.body })
+            logText = msg.text?.body ?? logText
+            break
+          case 'image':
+            enqueue({ ...base, text: msg.image?.caption, mediaId: msg.image?.id, mimeType: msg.image?.mime_type })
+            logText = msg.image?.caption ? `[imagem] ${msg.image.caption}` : '[imagem]'
+            break
+          case 'document':
+            enqueue({ ...base, text: msg.document?.caption, mediaId: msg.document?.id, mimeType: msg.document?.mime_type, filename: msg.document?.filename })
+            logText = `[documento] ${msg.document?.filename ?? ''}`.trim()
+            break
+          case 'audio':
+            enqueue({ ...base, mediaId: msg.audio?.id, mimeType: msg.audio?.mime_type })
+            logText = '[áudio]'
+            break
+          case 'video':
+            enqueue({ ...base, text: msg.video?.caption, mediaId: msg.video?.id, mimeType: msg.video?.mime_type })
+            logText = msg.video?.caption ? `[vídeo] ${msg.video.caption}` : '[vídeo]'
+            break
+          case 'voice':
+            enqueue({ ...base, mediaId: msg.voice?.id, mimeType: msg.voice?.mime_type })
+            logText = '[mensagem de voz]'
+            break
+          case 'sticker':
+            enqueue({ ...base, mediaId: msg.sticker?.id, mimeType: msg.sticker?.mime_type })
+            logText = '[figurinha]'
+            break
+          case 'reaction':
+            enqueue({ ...base, reactionEmoji: msg.reaction?.emoji, reactionTargetWamid: msg.reaction?.message_id })
+            logText = `[reação] ${msg.reaction?.emoji ?? ''}`.trim()
+            break
+          case 'location':
+            enqueue({ ...base, latitude: msg.location?.latitude, longitude: msg.location?.longitude })
+            logText = '[localização]'
+            break
+          case 'interactive': {
+            const reply = msg.interactive?.button_reply ?? msg.interactive?.list_reply
+            enqueue({ ...base, text: reply?.title })
+            logText = reply?.title ? `[menu] ${reply.title}` : '[menu]'
+            break
+          }
+          default:
+            enqueue({ ...base, text: `(unsupported type: ${msg.type})` })
+        }
+
+        const ts = Date.now()
+        logMessage({ direction: 'in', chatId: msg.from, pushName, text: logText, timestamp: ts, wamid: msg.id })
+
+        // Skip auto-replying to plain reactions (a 👍 on an old message doesn't need a reply),
+        // and skip messages we've already handled (Meta retried the webhook delivery).
+        if (msg.type !== 'reaction' && !processedForAI.has(msg.id)) {
+          processedForAI.add(msg.id)
+          if (processedForAI.size > MAX_PROCESSED_FOR_AI) {
+            const oldest = processedForAI.values().next().value
+            if (oldest) processedForAI.delete(oldest)
+          }
+
+          if (msg.type === 'interactive') {
+            // Guided menu tap (category/product list, buttons) — handled deterministically,
+            // no AI call needed for navigation. Unrecognized interactive replies are ignored.
+            const wizId = msg.interactive?.button_reply?.id ?? msg.interactive?.list_reply?.id
+            if (wizId?.startsWith('wiz|')) {
+              pending.push(enqueueForChat(msg.from, () => handleWizardTap(msg.from, wizId, msg.id, pushName)))
+            }
+          } else if (msg.type === 'text' && isOrderTrigger(msg.text?.body ?? '')) {
+            // Customer typed a keyword like "pedido" — open the guided menu instead of asking the AI.
+            pending.push(enqueueForChat(msg.from, () => handleWizardTap(msg.from, 'wiz|start', msg.id, pushName)))
+          } else {
+            pending.push(enqueueForChat(msg.from, () => handleWithAI(msg.from, msg.id, logText, ts, pushName)))
+          }
+        }
+      }
+    }
+  }
+
+  return pending
+}
+
+// --- Hono app ---
+
+const app = new Hono()
+
+// Global error handler
+app.onError((err, c) => {
+  console.error('unhandled error:', err)
+  return c.json({ error: 'internal' }, 500)
+})
+
+// --- Meta-facing routes (no relay auth) ---
+
+// Webhook verification handshake
+app.get('/webhook', (c) => {
+  const mode = c.req.query('hub.mode')
+  const token = c.req.query('hub.verify_token')
+  const challenge = c.req.query('hub.challenge')
+
+  if (mode === 'subscribe' && token === VERIFY_TOKEN) {
+    return c.text(challenge ?? '', 200)
+  }
+  return c.text('Forbidden', 403)
+})
+
+// Receive inbound messages
+app.post('/webhook', async (c) => {
+  const rawBody = await c.req.text()
+
+  if (!verifySignature(rawBody, c.req.header('x-hub-signature-256'))) {
+    // Still return 200 — logging the rejection is enough.
+    // Returning 4xx would cause Meta to retry with the same bad signature.
+    console.error('webhook: invalid signature')
+    return c.text('ok', 200)
+  }
+
+  try {
+    const payload = JSON.parse(rawBody) as WaWebhookPayload
+    // Await the AI replies before responding — on Railway's free plan the
+    // container can sleep again right after this handler returns, which
+    // would cut off any reply work still running in the background.
+    await Promise.all(parseMessages(payload))
+  } catch (err) {
+    console.error('webhook: parse error:', err)
+  }
+
+  return c.text('ok', 200)
+})
+
+// Health check
+app.get('/health', (c) => {
+  return c.json({ ok: true, queue_size: queue.length, uptime: Math.floor((Date.now() - START) / 1000) })
+})
+
+// --- Auth middleware for local-facing routes ---
+
+app.use('/poll', async (c, next) => {
+  if (c.req.header('x-relay-secret') !== RELAY_SECRET) return c.json({ error: 'unauthorized' }, 401)
+  await next()
+})
+app.use('/send', async (c, next) => {
+  if (c.req.header('x-relay-secret') !== RELAY_SECRET) return c.json({ error: 'unauthorized' }, 401)
+  await next()
+})
+app.use('/send-media', async (c, next) => {
+  if (c.req.header('x-relay-secret') !== RELAY_SECRET) return c.json({ error: 'unauthorized' }, 401)
+  await next()
+})
+app.use('/react', async (c, next) => {
+  if (c.req.header('x-relay-secret') !== RELAY_SECRET) return c.json({ error: 'unauthorized' }, 401)
+  await next()
+})
+app.use('/mark-read', async (c, next) => {
+  if (c.req.header('x-relay-secret') !== RELAY_SECRET) return c.json({ error: 'unauthorized' }, 401)
+  await next()
+})
+
+// --- Local MCP server-facing routes ---
+
+// Poll for new messages
+app.get('/poll', (c) => {
+  const since = Number(c.req.query('since') ?? '0') || 0
+  const messages = queue.filter((m) => m.id > since)
+  const cursor = messages.length > 0 ? messages[messages.length - 1].id : since
+  return c.json({ messages, cursor })
+})
+
+// Send text message
+app.post('/send', async (c) => {
+  const { to, text, reply_to } = await c.req.json<{ to: string; text: string; reply_to?: string }>()
+
+  const result = await sendText(to, text, reply_to)
+  if (!result.ok) return c.json({ error: result.data }, result.status as ContentfulStatusCode)
+
+  const wamid = (result.data as { messages?: Array<{ id: string }> }).messages?.[0]?.id
+  return c.json({ wamid })
+})
+
+// Send media message
+app.post('/send-media', async (c) => {
+  const { to, type, url, caption, filename, reply_to } = await c.req.json<{
+    to: string
+    type: 'image' | 'document' | 'audio' | 'video'
+    url: string
+    caption?: string
+    filename?: string
+    reply_to?: string
+  }>()
+
+  const mediaObj: Record<string, unknown> = { link: url }
+  if (caption) mediaObj.caption = caption
+  if (filename && type === 'document') mediaObj.filename = filename
+
+  const body: Record<string, unknown> = {
+    messaging_product: 'whatsapp',
+    to,
+    type,
+    [type]: mediaObj,
+  }
+  if (reply_to) body.context = { message_id: reply_to }
+
+  const result = await waApi('/messages', body)
+  if (!result.ok) return c.json({ error: result.data }, result.status as ContentfulStatusCode)
+
+  const wamid = (result.data as { messages?: Array<{ id: string }> }).messages?.[0]?.id
+  logMessage({ direction: 'out', chatId: to, text: caption ? `[${type}] ${caption}` : `[${type}]`, timestamp: Date.now(), wamid })
+  return c.json({ wamid })
+})
+
+// Send reaction
+app.post('/react', async (c) => {
+  const { to, wamid, emoji } = await c.req.json<{ to: string; wamid: string; emoji: string }>()
+
+  const result = await waApi('/messages', {
+    messaging_product: 'whatsapp',
+    to,
+    type: 'reaction',
+    reaction: { message_id: wamid, emoji },
+  })
+  if (!result.ok) return c.json({ error: result.data }, result.status as ContentfulStatusCode)
+
+  const sentId = (result.data as { messages?: Array<{ id: string }> }).messages?.[0]?.id
+  return c.json({ wamid: sentId })
+})
+
+// Send read receipt
+app.post('/mark-read', async (c) => {
+  const { wamid } = await c.req.json<{ wamid: string }>()
+
+  const result = await waApi('/messages', {
+    messaging_product: 'whatsapp',
+    status: 'read',
+    message_id: wamid,
+  })
+  if (!result.ok) return c.json({ error: result.data }, result.status as ContentfulStatusCode)
+  return c.json({ ok: true })
+})
+
+// --- Conversation dashboard (read-only, token-protected) ---
+
+// Returns the conversation log as JSON, newest last.
+app.get('/log', (c) => {
+  if (c.req.query('token') !== DASHBOARD_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+  return c.json({ log })
+})
+
+// Lets the dashboard reply to a customer as the business. Gated by the same
+// DASHBOARD_TOKEN as the rest of the dashboard (not RELAY_SECRET) — anyone who
+// can see the conversations can reply to them, and the two tokens stay
+// independent in case DASHBOARD_TOKEN is ever set to something separate.
+app.post('/dashboard-send', async (c) => {
+  if (c.req.query('token') !== DASHBOARD_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+
+  const { to, text } = await c.req.json<{ to: string; text: string }>()
+  if (!to || !text?.trim()) return c.json({ error: 'to e text são obrigatórios' }, 400)
+
+  const result = await sendText(to, text.trim())
+  if (!result.ok) return c.json({ error: result.data }, result.status as ContentfulStatusCode)
+
+  const wamid = (result.data as { messages?: Array<{ id: string }> }).messages?.[0]?.id
+  return c.json({ wamid })
+})
+
+// Simple mobile-friendly page that polls /log and renders it as chat bubbles per contact.
+app.get('/dashboard', (c) => {
+  if (c.req.query('token') !== DASHBOARD_TOKEN) return c.text('Forbidden — adicione ?token=SEU_TOKEN na URL.', 401)
+  const token = c.req.query('token')
+  return c.html(`<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conversas — Quick Gráfica</title>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, system-ui, sans-serif; background: #eae6df; color: #111; }
+  header { position: sticky; top: 0; background: #075e54; color: #fff; padding: 12px 16px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; z-index: 10; }
+  header .status { font-weight: 400; font-size: 12px; opacity: 0.85; }
+  #layout { display: flex; height: calc(100vh - 48px); }
+  #contacts { width: 260px; min-width: 200px; background: #fff; overflow-y: auto; border-right: 1px solid #ddd; }
+  .contact { padding: 12px 14px; border-bottom: 1px solid #eee; cursor: pointer; }
+  .contact:hover, .contact.active { background: #f0f0f0; }
+  .contact .name { font-weight: 600; font-size: 14px; }
+  .contact .preview { font-size: 12px; color: #666; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #chat-panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #chat { flex: 1; overflow-y: auto; padding: 16px; }
+  .bubble { max-width: 70%; padding: 8px 12px; border-radius: 8px; margin-bottom: 8px; font-size: 14px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
+  .bubble.in { background: #fff; margin-right: auto; }
+  .bubble.out { background: #d9fdd3; margin-left: auto; }
+  .bubble .meta { font-size: 10px; color: #888; margin-top: 4px; text-align: right; }
+  #empty { padding: 40px; text-align: center; color: #888; }
+  #composer { display: none; gap: 8px; padding: 10px; background: #f0f0f0; border-top: 1px solid #ddd; }
+  #composer.visible { display: flex; }
+  #msgInput { flex: 1; padding: 10px 12px; border-radius: 20px; border: 1px solid #ccc; font-size: 14px; font-family: inherit; outline: none; }
+  #sendBtn { padding: 0 18px; border-radius: 20px; border: none; background: #075e54; color: #fff; font-size: 14px; cursor: pointer; }
+  #sendBtn:disabled { opacity: 0.5; cursor: default; }
+  #sendError { color: #c0392b; font-size: 12px; padding: 0 12px 8px; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #0b141a; color: #eee; }
+    #contacts { background: #111b21; border-color: #222; }
+    .contact { border-color: #222; }
+    .contact:hover, .contact.active { background: #1f2c33; }
+    .contact .preview { color: #999; }
+    .bubble.in { background: #1f2c33; }
+    .bubble.out { background: #005c4b; }
+    #composer { background: #111b21; border-color: #222; }
+    #msgInput { background: #1f2c33; border-color: #333; color: #eee; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <span>Conversas — Quick Gráfica</span>
+  <span class="status" id="status">carregando…</span>
+</header>
+<div id="layout">
+  <div id="contacts"></div>
+  <div id="chat-panel">
+    <div id="chat"><div id="empty">Selecione uma conversa</div></div>
+    <div id="sendError"></div>
+    <div id="composer">
+      <input id="msgInput" type="text" placeholder="Digite uma mensagem..." autocomplete="off">
+      <button id="sendBtn">Enviar</button>
+    </div>
+  </div>
+</div>
+<script>
+const TOKEN = ${JSON.stringify(token)};
+let selected = null;
+let lastLen = 0;
+
+async function tick() {
+  try {
+    const res = await fetch('/log?token=' + encodeURIComponent(TOKEN));
+    if (!res.ok) { document.getElementById('status').textContent = 'erro de autenticação'; return; }
+    const { log } = await res.json();
+    document.getElementById('status').textContent = 'atualizado ' + new Date().toLocaleTimeString('pt-BR');
+    render(log);
+  } catch (e) {
+    document.getElementById('status').textContent = 'sem conexão';
+  }
+}
+
+function render(log) {
+  const byContact = {};
+  for (const m of log) {
+    if (!byContact[m.chatId]) byContact[m.chatId] = [];
+    byContact[m.chatId].push(m);
+  }
+  const contacts = Object.keys(byContact).sort((a, b) => {
+    const la = byContact[a][byContact[a].length - 1].timestamp;
+    const lb = byContact[b][byContact[b].length - 1].timestamp;
+    return lb - la;
+  });
+
+  if (!selected && contacts.length) selected = contacts[0];
+
+  const contactsEl = document.getElementById('contacts');
+  contactsEl.innerHTML = '';
+  for (const id of contacts) {
+    const msgs = byContact[id];
+    const last = msgs[msgs.length - 1];
+    const name = msgs.find(m => m.pushName)?.pushName || id;
+    const div = document.createElement('div');
+    div.className = 'contact' + (id === selected ? ' active' : '');
+    div.innerHTML = '<div class="name">' + escapeHtml(name) + '</div><div class="preview">' + escapeHtml(last.text || '') + '</div>';
+    div.onclick = () => { selected = id; lastLen = 0; document.getElementById('sendError').textContent = ''; render(log); };
+    contactsEl.appendChild(div);
+  }
+
+  const composerEl = document.getElementById('composer');
+  composerEl.classList.toggle('visible', !!selected);
+
+  const chatEl = document.getElementById('chat');
+  if (!selected) { chatEl.innerHTML = '<div id="empty">Nenhuma conversa ainda</div>'; return; }
+  const msgs = byContact[selected] || [];
+  if (msgs.length === lastLen) return; // avoid re-render/flicker when nothing changed for this contact
+  lastLen = msgs.length;
+  chatEl.innerHTML = '';
+  for (const m of msgs) {
+    const div = document.createElement('div');
+    div.className = 'bubble ' + m.direction;
+    const time = new Date(m.timestamp).toLocaleString('pt-BR');
+    div.innerHTML = escapeHtml(m.text || '') + '<div class="meta">' + time + '</div>';
+    chatEl.appendChild(div);
+  }
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+const msgInput = document.getElementById('msgInput');
+const sendBtn = document.getElementById('sendBtn');
+const sendErrorEl = document.getElementById('sendError');
+
+async function sendMessage() {
+  const text = msgInput.value.trim();
+  if (!text || !selected) return;
+
+  sendBtn.disabled = true;
+  msgInput.disabled = true;
+  sendErrorEl.textContent = '';
+
+  try {
+    const res = await fetch('/dashboard-send?token=' + encodeURIComponent(TOKEN), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ to: selected, text }),
+    });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      sendErrorEl.textContent = 'Falha ao enviar: ' + (body.error ? JSON.stringify(body.error) : res.status);
+    } else {
+      msgInput.value = '';
+      lastLen = 0; // force the next tick to re-render this chat with the message we just sent
+      tick();
+    }
+  } catch (e) {
+    sendErrorEl.textContent = 'Sem conexão — tente de novo.';
+  } finally {
+    sendBtn.disabled = false;
+    msgInput.disabled = false;
+    msgInput.focus();
+  }
+}
+
+sendBtn.onclick = sendMessage;
+msgInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
+});
+
+tick();
+setInterval(tick, 4000);
+</script>
+</body>
+</html>`)
+})
+
+// --- Start ---
+
+serve({ fetch: app.fetch, port: PORT }, (info) => {
+  console.log(`whatsapp relay listening on :${info.port}`)
+})
