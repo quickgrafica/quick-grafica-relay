@@ -44,7 +44,7 @@ const START = Date.now()
 
 // --- AI assistant setup ---
 
-const AI_MODEL = 'claude-haiku-4-5-20251001'
+const AI_MODEL = 'claude-sonnet-5'
 const anthropic = new Anthropic({ apiKey: ANTHROPIC_API_KEY })
 
 const AI_INSTRUCTIONS = readFileSync(new URL('./instrucoes.md', import.meta.url), 'utf8')
@@ -416,172 +416,26 @@ async function sendList(
   return result
 }
 
-// --- Order wizard (guided category → subcategory → product menu via buttons/lists) ---
+// --- Order wizard (order-closing buttons + AI option taps) ---
 //
-// This is pure navigation, driven by the catalog index we already built for AI search —
-// no AI call, no tokens spent, until the customer lands on one exact product. At that
-// point we hand off to the normal AI flow (which already knows to re-search before
-// quoting a price) by just sending the product's full details as a plain message, the
-// same way a human would type it — the AI picks up from there on the customer's next reply.
-
-const ORDER_TRIGGERS = new Set(['pedido', 'fazer pedido', 'menu', 'catalogo', 'ver produtos', 'ver catalogo'])
-
-function isOrderTrigger(text: string): boolean {
-  return ORDER_TRIGGERS.has(normalize(text.trim()))
-}
+// Category/subcategory/product browsing used to live here as a button-driven menu,
+// but that meant customers picked from a flat list instead of the assistant actually
+// figuring out what they need. It's gone — a customer typing "pedido"/"menu"/etc. now
+// falls through to the normal AI flow like any other message, and `instrucoes.md`
+// guides the AI through a short discovery conversation (finalidade → quantidade →
+// tamanho → arte) before it searches the catalog and quotes. What's left here is just
+// the order-closing buttons (`offersOrderButtons`) and resolving a tap on the AI's own
+// `mostrar_opcoes` buttons/list back to text (`wiz|opt|`).
 
 // Holds the last set of AI-generated options offered to each chat (see the
 // `mostrar_opcoes` tool below), so a tap on one can be resolved back to its
 // full text and fed into the AI flow as if the customer had typed it.
 const pendingOptions = new Map<string, string[]>()
 
-const CATEGORIES = [...new Set(CATALOG_ENTRIES.map((e) => e.category))]
-
-function subcategoriesOf(cat: string): string[] {
-  return [...new Set(CATALOG_ENTRIES.filter((e) => e.category === cat && e.subcategory).map((e) => e.subcategory))]
-}
-
-function entriesOf(cat: string, sub: string): Array<{ e: CatalogEntry; i: number }> {
-  return CATALOG_ENTRIES.map((e, i) => ({ e, i })).filter(({ e }) => e.category === cat && (e.subcategory || '') === sub)
-}
-
-function slugToLabel(s: string): string {
-  const minor = new Set(['e', 'de', 'da', 'do', 'das', 'dos'])
-  return s
-    .split('-')
-    .map((w, i) => (i > 0 && minor.has(w) ? w : w.charAt(0).toUpperCase() + w.slice(1)))
-    .join(' ')
-}
-
-function shortDesc(body: string): string {
-  const firstLine = body.split('\n')[0] ?? ''
-  return firstLine.replace(/^-\s*/, '').slice(0, 72)
-}
-
-// Many catalog entries share the same product name and are only told apart by a short
-// code in parentheses at the end (e.g. "Adesivo Vinil Metro Quadrado (0129570E)"). A plain
-// 24-char slice would cut that code off and leave several rows looking identical, so keep
-// the code visible and trim the descriptive part instead.
-function rowTitle(heading: string): string {
-  const m = heading.match(/^(.*?)\s*\(([0-9A-F]{6,8})\)\s*$/)
-  if (m) {
-    const room = Math.max(24 - (m[2].length + 3), 1)
-    return `${m[1].slice(0, room)} (${m[2]})`.slice(0, 24)
-  }
-  return heading.slice(0, 24)
-}
-
-const WIZ_PAGE_TOP = 9 // top-level list: leaves room for 1 "more" row (10 rows max total)
-const WIZ_PAGE_SUB = 8 // nested lists: leaves room for "more" + "back" rows
-
-function paginate<T>(items: T[], p: number, size: number): { items: T[]; hasMore: boolean } {
-  const start = p * size
-  return { items: items.slice(start, start + size), hasMore: items.length > start + size }
-}
-
-async function sendCategoryList(chatId: string, p: number, replyTo?: string): Promise<void> {
-  const { items, hasMore } = paginate(CATEGORIES, p, WIZ_PAGE_TOP)
-  const rows: ListRow[] = items.map((cat) => ({ id: `wiz|cat|${cat}`, title: slugToLabel(cat).slice(0, 24) }))
-  if (hasMore) rows.push({ id: `wiz|catmore|${p + 1}`, title: '➡️ Ver mais opções' })
-  await sendList(
-    chatId,
-    {
-      header: 'Fazer pedido',
-      body: 'Escolha uma categoria:',
-      buttonText: 'Categorias',
-      sections: [{ title: 'Categorias', rows }],
-    },
-    replyTo,
-  )
-}
-
-async function sendSubcategoryList(chatId: string, cat: string, p: number, replyTo?: string): Promise<void> {
-  const { items, hasMore } = paginate(subcategoriesOf(cat), p, WIZ_PAGE_SUB)
-  const rows: ListRow[] = items.map((sub) => ({ id: `wiz|sub|${cat}|${sub}`, title: slugToLabel(sub).slice(0, 24) }))
-  if (hasMore) rows.push({ id: `wiz|submore|${cat}|${p + 1}`, title: '➡️ Ver mais opções' })
-  rows.push({ id: 'wiz|backcat', title: '🔙 Voltar' })
-  await sendList(
-    chatId,
-    {
-      header: slugToLabel(cat),
-      body: 'Escolha uma subcategoria:',
-      buttonText: 'Subcategorias',
-      sections: [{ title: 'Subcategorias', rows }],
-    },
-    replyTo,
-  )
-}
-
-async function sendProductList(chatId: string, cat: string, sub: string, p: number, replyTo?: string): Promise<void> {
-  const { items, hasMore } = paginate(entriesOf(cat, sub), p, WIZ_PAGE_SUB)
-  const rows: ListRow[] = items.map(({ e, i }) => ({
-    id: `wiz|prod|${i}`,
-    title: rowTitle(e.heading),
-    description: shortDesc(e.body),
-  }))
-  if (hasMore) rows.push({ id: `wiz|prodmore|${cat}|${sub}|${p + 1}`, title: '➡️ Ver mais opções' })
-  rows.push({ id: sub ? `wiz|backsub|${cat}` : 'wiz|backcat', title: '🔙 Voltar' })
-  await sendList(
-    chatId,
-    {
-      header: slugToLabel(sub || cat),
-      body: 'Escolha um produto:',
-      buttonText: 'Produtos',
-      sections: [{ title: 'Produtos', rows }],
-    },
-    replyTo,
-  )
-}
-
 async function handleWizardTap(chatId: string, id: string, replyTo?: string, pushName?: string): Promise<void> {
   try {
-    if (id === 'wiz|start' || id === 'wiz|backcat') {
-      await sendCategoryList(chatId, 0, replyTo)
-      return
-    }
-    if (id.startsWith('wiz|catmore|')) {
-      await sendCategoryList(chatId, Number(id.split('|')[2]) || 0, replyTo)
-      return
-    }
-    if (id.startsWith('wiz|cat|')) {
-      const cat = id.split('|')[2]
-      const subs = subcategoriesOf(cat)
-      if (subs.length === 0) await sendProductList(chatId, cat, '', 0, replyTo)
-      else await sendSubcategoryList(chatId, cat, 0, replyTo)
-      return
-    }
-    if (id.startsWith('wiz|backsub|')) {
-      await sendSubcategoryList(chatId, id.split('|')[2], 0, replyTo)
-      return
-    }
-    if (id.startsWith('wiz|submore|')) {
-      const [, , cat, p] = id.split('|')
-      await sendSubcategoryList(chatId, cat, Number(p) || 0, replyTo)
-      return
-    }
-    if (id.startsWith('wiz|sub|')) {
-      const [, , cat, sub] = id.split('|')
-      await sendProductList(chatId, cat, sub, 0, replyTo)
-      return
-    }
-    if (id.startsWith('wiz|prodmore|')) {
-      const [, , cat, sub, p] = id.split('|')
-      await sendProductList(chatId, cat, sub, Number(p) || 0, replyTo)
-      return
-    }
-    if (id.startsWith('wiz|prod|')) {
-      const idx = Number(id.split('|')[2])
-      const entry = CATALOG_ENTRIES[idx]
-      if (!entry) return
-      await sendText(
-        chatId,
-        `*${entry.heading}*\n${entry.body.trim()}\n\nQuantas unidades (ou m²) você quer? Me diz que já confirmo o valor certinho. 🙂`,
-        replyTo,
-      )
-      await sendButtons(chatId, 'Quer ver outro produto ou falar com a equipe?', [
-        { id: 'wiz|backcat', title: 'Outro produto' },
-        { id: 'wiz|human', title: 'Falar com equipe' },
-      ])
+    if (id === 'wiz|outro') {
+      await sendText(chatId, 'Claro! Me conta o que você precisa que eu já vejo pra você. 🙂', replyTo)
       return
     }
     if (id === 'wiz|human') {
@@ -615,13 +469,12 @@ async function handleWizardTap(chatId: string, id: string, replyTo?: string, pus
   }
 }
 
-// After the AI quotes a price (its reply mentions "R$"), offer the same follow-up
-// buttons the guided menu shows — so the customer can close, browse another
-// product, or ask for a human, whether they got here by typing or by tapping.
+// After the AI quotes a price (its reply mentions "R$"), offer follow-up buttons so
+// the customer can close, ask about something else, or ask for a human.
 function offersOrderButtons(chatId: string): Promise<{ ok: boolean; status: number; data: unknown }> {
   return sendButtons(chatId, 'Posso seguir com esse pedido?', [
     { id: 'wiz|close', title: '✅ Fechar pedido' },
-    { id: 'wiz|backcat', title: '🔁 Outro produto' },
+    { id: 'wiz|outro', title: '🔁 Outro produto' },
     { id: 'wiz|human', title: '💬 Falar com equipe' },
   ])
 }
@@ -910,15 +763,13 @@ function parseMessages(payload: WaWebhookPayload): Promise<void>[] {
           }
 
           if (msg.type === 'interactive') {
-            // Guided menu tap (category/product list, buttons) — handled deterministically,
-            // no AI call needed for navigation. Unrecognized interactive replies are ignored.
+            // Tap on an order-closing button or one of the AI's own mostrar_opcoes
+            // buttons/list — handled deterministically, no AI call needed. Unrecognized
+            // interactive replies are ignored.
             const wizId = msg.interactive?.button_reply?.id ?? msg.interactive?.list_reply?.id
             if (wizId?.startsWith('wiz|')) {
               pending.push(enqueueForChat(msg.from, () => handleWizardTap(msg.from, wizId, msg.id, pushName)))
             }
-          } else if (msg.type === 'text' && isOrderTrigger(msg.text?.body ?? '')) {
-            // Customer typed a keyword like "pedido" — open the guided menu instead of asking the AI.
-            pending.push(enqueueForChat(msg.from, () => handleWizardTap(msg.from, 'wiz|start', msg.id, pushName)))
           } else {
             pending.push(enqueueForChat(msg.from, () => handleWithAI(msg.from, msg.id, logText, ts, pushName)))
           }
