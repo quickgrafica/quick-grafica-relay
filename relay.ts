@@ -546,6 +546,112 @@ function logMessage(entry: LogEntry): void {
   }
 }
 
+// --- Conversation review (which chats deserve a human's attention) ---
+//
+// Problems were being found by scrolling screenshots one conversation at a time.
+// These flags surface the chats worth reading: where Sophia escalated, where the
+// customer corrected her, where they had to repeat themselves, where she said
+// the product doesn't exist, or where a reply took so long the customer gave up.
+// Each flag points at a knowledge gap or a bug — which is the list that makes
+// the assistant better week over week.
+
+interface ReviewFlag {
+  code: string
+  label: string
+  detail?: string
+}
+
+interface ReviewItem {
+  chatId: string
+  name: string
+  lastAt: number
+  messages: number
+  flags: ReviewFlag[]
+}
+
+// A reply this slow means the customer sat waiting — the app asleep, the API
+// stalling, or an error swallowed somewhere. It is how the sleeping-container
+// bug showed up in real conversations.
+const SLOW_REPLY_MS = 3 * 60 * 1000
+// A quote nobody answered for this long counts as a conversation that died.
+const ABANDONED_AFTER_MS = 2 * 60 * 60 * 1000
+
+const RE_CORRECTION = /nao e isso|nao eh isso|esta errado|ta errado|nao tem |nao existe|na verdade|nao foi isso|nao seria|voce errou|errou o|nao e bem/
+const RE_ESCALATED = /confirmar com a equipe|confirmo com a equipe|equipe vai confirmar|vou confirmar com|passar pra equipe|passo pra equipe|falar com a equipe|equipe confirma/
+const RE_NOT_FOUND = /nao temos|nao trabalhamos|nao encontrei|nao consegui localizar|nao faz parte do nosso|nao esta no catalogo/
+const RE_HUMAN_BUTTON = /falar com equipe/
+
+function reviewConversations(entries: LogEntry[]): ReviewItem[] {
+  const byChat = new Map<string, LogEntry[]>()
+  for (const e of entries) {
+    if (!byChat.has(e.chatId)) byChat.set(e.chatId, [])
+    byChat.get(e.chatId)!.push(e)
+  }
+
+  const items: ReviewItem[] = []
+  const now = Date.now()
+
+  for (const [chatId, msgs] of byChat) {
+    msgs.sort((a, b) => a.timestamp - b.timestamp)
+    const flags: ReviewFlag[] = []
+    const add = (code: string, label: string, detail?: string) => {
+      if (!flags.some((f) => f.code === code)) flags.push({ code, label, detail })
+    }
+
+    let lastInboundText = ''
+    for (let i = 0; i < msgs.length; i++) {
+      const m = msgs[i]
+      const text = normalize(m.text ?? '')
+
+      if (m.direction === 'in') {
+        if (RE_HUMAN_BUTTON.test(text)) {
+          add('humano', 'Cliente pediu atendimento humano')
+        } else if (RE_CORRECTION.test(text)) {
+          add('correcao', 'Cliente corrigiu a Sophia', m.text)
+        }
+        // "?" alone, or the same message sent twice, means the previous answer
+        // didn't land.
+        const bare = text.replace(/[^a-z0-9]/g, '')
+        if (!bare && /\?/.test(text)) add('repeticao', 'Cliente mandou só "?" — não foi entendido')
+        else if (bare && bare === lastInboundText) add('repeticao', 'Cliente repetiu a mesma mensagem', m.text)
+        if (bare) lastInboundText = bare
+
+        // How long the customer waited for the next reply.
+        const reply = msgs.slice(i + 1).find((x) => x.direction === 'out')
+        if (reply && reply.timestamp - m.timestamp > SLOW_REPLY_MS) {
+          const mins = Math.round((reply.timestamp - m.timestamp) / 60000)
+          add('demora', `Resposta demorou ${mins} min`)
+        }
+      } else {
+        if (RE_ESCALATED.test(text)) add('escalou', 'Sophia mandou confirmar com a equipe')
+        if (RE_NOT_FOUND.test(text)) add('sem_produto', 'Sophia disse que não tem o produto', m.text)
+      }
+    }
+
+    // Quoted a price and the customer never came back.
+    const last = msgs[msgs.length - 1]
+    if (
+      last.direction === 'out' &&
+      /r\$\s?\d/.test(normalize(last.text ?? '')) &&
+      now - last.timestamp > ABANDONED_AFTER_MS
+    ) {
+      add('sem_retorno', 'Orçamento enviado e o cliente não respondeu')
+    }
+
+    if (flags.length) {
+      items.push({
+        chatId,
+        name: msgs.find((m) => m.pushName)?.pushName ?? chatId,
+        lastAt: last.timestamp,
+        messages: msgs.length,
+        flags,
+      })
+    }
+  }
+
+  return items.sort((a, b) => b.lastAt - a.lastAt)
+}
+
 // --- Signature validation ---
 
 function verifySignature(rawBody: string, header: string | undefined): boolean {
@@ -1233,6 +1339,12 @@ app.get('/log', (c) => {
   return c.json({ log })
 })
 
+// The review queue: conversations with something worth a human's eyes, and why.
+app.get('/revisao', (c) => {
+  if (c.req.query('token') !== DASHBOARD_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+  return c.json({ items: reviewConversations(log) })
+})
+
 // Lets the dashboard reply to a customer as the business. Gated by the same
 // DASHBOARD_TOKEN as the rest of the dashboard (not RELAY_SECRET) — anyone who
 // can see the conversations can reply to them, and the two tokens stay
@@ -1285,6 +1397,24 @@ app.get('/dashboard', (c) => {
   #sendBtn { padding: 0 18px; border-radius: 20px; border: none; background: #075e54; color: #fff; font-size: 14px; cursor: pointer; }
   #sendBtn:disabled { opacity: 0.5; cursor: default; }
   #sendError { color: #c0392b; font-size: 12px; padding: 0 12px 8px; }
+  header .tabs { display: flex; gap: 6px; }
+  header button.tab { background: rgba(255,255,255,0.15); color: #fff; border: none; padding: 6px 12px; border-radius: 14px; font-size: 13px; font-family: inherit; cursor: pointer; }
+  header button.tab.active { background: #fff; color: #075e54; font-weight: 600; }
+  #review { flex: 1; overflow-y: auto; padding: 12px; display: none; }
+  #review.visible { display: block; }
+  #review .intro { font-size: 13px; color: #555; margin-bottom: 12px; line-height: 1.5; }
+  .rev { background: #fff; border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; cursor: pointer; border: 1px solid #ddd; }
+  .rev:hover { border-color: #075e54; }
+  .rev .top { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; }
+  .rev .who { font-weight: 600; }
+  .rev .when { color: #888; font-size: 11px; white-space: nowrap; }
+  .rev .flags { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 6px; }
+  .rev .flag { font-size: 11px; padding: 3px 8px; border-radius: 10px; background: #eee; color: #333; }
+  .rev .flag.correcao, .rev .flag.sem_produto { background: #fdecea; color: #922b21; }
+  .rev .flag.repeticao, .rev .flag.demora { background: #fef5e7; color: #9c640c; }
+  .rev .flag.escalou, .rev .flag.humano { background: #eaf2f8; color: #1a5276; }
+  .rev .quote { margin-top: 8px; font-size: 12px; color: #666; font-style: italic; border-left: 3px solid #ddd; padding-left: 8px; white-space: pre-wrap; word-break: break-word; }
+  #review .none { text-align: center; color: #888; padding: 40px 20px; font-size: 14px; }
   @media (prefers-color-scheme: dark) {
     body { background: #0b141a; color: #eee; }
     #contacts { background: #111b21; border-color: #222; }
@@ -1295,12 +1425,22 @@ app.get('/dashboard', (c) => {
     .bubble.out { background: #005c4b; }
     #composer { background: #111b21; border-color: #222; }
     #msgInput { background: #1f2c33; border-color: #333; color: #eee; }
+    #review .intro { color: #aaa; }
+    .rev { background: #111b21; border-color: #222; }
+    .rev .flag { background: #1f2c33; color: #ddd; }
+    .rev .flag.correcao, .rev .flag.sem_produto { background: #4a1f1a; color: #f5b7b1; }
+    .rev .flag.repeticao, .rev .flag.demora { background: #4a3a15; color: #f7dc6f; }
+    .rev .flag.escalou, .rev .flag.humano { background: #17334d; color: #aed6f1; }
+    .rev .quote { color: #999; border-color: #333; }
   }
 </style>
 </head>
 <body>
 <header>
-  <span>Conversas — Quick Gráfica</span>
+  <div class="tabs">
+    <button class="tab active" id="tabConversas">Conversas</button>
+    <button class="tab" id="tabRevisao">Revisão</button>
+  </div>
   <span class="status" id="status">carregando…</span>
 </header>
 <div id="layout">
@@ -1313,11 +1453,13 @@ app.get('/dashboard', (c) => {
       <button id="sendBtn">Enviar</button>
     </div>
   </div>
+  <div id="review"></div>
 </div>
 <script>
 const TOKEN = ${JSON.stringify(token)};
 let selected = null;
 let lastLen = 0;
+let tab = 'conversas';
 
 async function tick() {
   try {
@@ -1326,8 +1468,58 @@ async function tick() {
     const { log } = await res.json();
     document.getElementById('status').textContent = 'atualizado ' + new Date().toLocaleTimeString('pt-BR');
     render(log);
+    if (tab === 'revisao') loadReview();
   } catch (e) {
     document.getElementById('status').textContent = 'sem conexão';
+  }
+}
+
+function setTab(next) {
+  tab = next;
+  document.getElementById('tabConversas').classList.toggle('active', next === 'conversas');
+  document.getElementById('tabRevisao').classList.toggle('active', next === 'revisao');
+  document.getElementById('contacts').style.display = next === 'conversas' ? '' : 'none';
+  document.getElementById('chat-panel').style.display = next === 'conversas' ? '' : 'none';
+  document.getElementById('review').classList.toggle('visible', next === 'revisao');
+  if (next === 'revisao') loadReview();
+}
+
+async function loadReview() {
+  const el = document.getElementById('review');
+  try {
+    const res = await fetch('/revisao?token=' + encodeURIComponent(TOKEN));
+    if (!res.ok) { el.innerHTML = '<div class="none">Erro ao carregar.</div>'; return; }
+    const { items } = await res.json();
+    renderReview(items);
+  } catch (e) {
+    el.innerHTML = '<div class="none">Sem conexão.</div>';
+  }
+}
+
+function renderReview(items) {
+  const el = document.getElementById('review');
+  if (!items.length) {
+    el.innerHTML = '<div class="none">Nenhuma conversa precisando de atenção. 👍</div>';
+    return;
+  }
+  let html = '<div class="intro">Conversas que valem uma olhada — cada marca aponta um conhecimento que falta ou um erro pra corrigir. Toque para abrir a conversa.</div>';
+  for (const it of items) {
+    const when = new Date(it.lastAt).toLocaleString('pt-BR');
+    const flags = it.flags.map(f => '<span class="flag ' + f.code + '">' + escapeHtml(f.label) + '</span>').join('');
+    const quoted = it.flags.filter(f => f.detail).slice(0, 2)
+      .map(f => '<div class="quote">' + escapeHtml(f.detail) + '</div>').join('');
+    html += '<div class="rev" data-chat="' + escapeHtml(it.chatId) + '">' +
+      '<div class="top"><span class="who">' + escapeHtml(it.name) + '</span><span class="when">' + when + '</span></div>' +
+      '<div class="flags">' + flags + '</div>' + quoted + '</div>';
+  }
+  el.innerHTML = html;
+  for (const card of el.querySelectorAll('.rev')) {
+    card.onclick = () => {
+      selected = card.getAttribute('data-chat');
+      lastLen = 0;
+      setTab('conversas');
+      tick();
+    };
   }
 }
 
@@ -1420,6 +1612,9 @@ sendBtn.onclick = sendMessage;
 msgInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') { e.preventDefault(); sendMessage(); }
 });
+
+document.getElementById('tabConversas').onclick = () => setTab('conversas');
+document.getElementById('tabRevisao').onclick = () => setTab('revisao');
 
 tick();
 setInterval(tick, 4000);
