@@ -118,9 +118,95 @@ function normalize(s: string): string {
 
 const MAX_SEARCH_RESULTS = 8
 const MAX_SEARCH_CHARS = 6000
+// Same product in several sizes/codes shouldn't eat every result slot.
+const MAX_PER_HEADING = 2
+
+// Words that sit in hundreds of product names ("personalizada") or in every
+// sentence ("para", "quero"). Scoring them buries the real answer: before this
+// list, "algo para colocar na camiseta" returned Bloco / Caderno Personalizado,
+// because "personalizado" is in ~200 headings and "camiseta" is in none.
+const SEARCH_STOPWORDS = new Set(
+  ('a o as os e de da do das dos para pra por com em na no nas nos um uma uns umas que qual quais ' +
+    'meu minha meus minhas seu sua eu voce voces vcs quero queria preciso precisava gostaria ' +
+    'fazer faz tem tenho ter algo alguma alguns coisa sobre mais menos muito pouco bem ser vai vou ' +
+    'esta este isso aqui ali la ai colocar usar comprar orcamento valor ' +
+    'personalizado personalizada personalizados personalizadas impresso impressa impressos impressas ' +
+    // Field labels that appear in every single entry ("Material:", "Formato:"),
+    // so they rank nothing — they just add noise to whatever else was asked.
+    'material formato acabamento prazo cores impressao preco precos opcoes opcao quantidade ' +
+    'unidade unidades produto produtos').split(' '),
+)
+
+// Bridges what the customer says to what this catalog calls things. "Camiseta"
+// appears nowhere in the catalog — the product is "Adesivo DTF TÊXTIL". Each
+// rule that matches the customer's phrase adds its catalog terms to the query,
+// so intent finds the product with no word in common. Every term here was
+// checked against real headings in catalogo.md.
+const SEARCH_INTENTS: Array<{ when: RegExp; add: string }> = [
+  { when: /camiset|camisa|blusa|roupa|uniforme|tecido|estampa|moletom|bone/, add: 'dtf textil' },
+  { when: /carro|veiculo|moto|frota|van|caminhao|adesivar o carro|envelopamento/, add: 'vinil metro quadrado plotter recorte' },
+  { when: /feira|stand|estande|exposicao|congresso|palestra|convencao/, add: 'roll up wind banner totem backdrop' },
+  { when: /identific|credencia|cracha|acesso|participante|convidado|inscrit/, add: 'pulseira cracha credencial cordao' },
+  { when: /vitrine|porta de vidro|janela|vidro da loja/, add: 'adesivo vitrine' },
+  { when: /fachada|frente da loja|muro|tapume/, add: 'lona perfurada adesivo vitrine faixa banner' },
+  { when: /divulg|propagand|anunci|publicidade|chamar atencao|na rua|marketing/, add: 'banner faixa panfleto cartaz wind banner' },
+  { when: /chao|piso|pisar/, add: 'adesivo de piso' },
+  { when: /parede/, add: 'adesivo de parede papel de parede' },
+  { when: /quadro|decorar|decoracao|sala|quarto|ambiente/, add: 'quadro decorativo canvas' },
+  { when: /cardapio|restaurante|lanchonete|bar |pizzaria|menu do/, add: 'cardapio' },
+  { when: /brinde|lembranc|souvenir|mimo|presente|sorteio/, add: 'caneca caneta squeeze copo termico botton mouse pad' },
+  { when: /caixa de luz|luminoso|iluminad|backlight/, add: 'lona backlight' },
+  { when: /embalagem|rotulo|pote|frasco|garrafa|sache|produto meu/, add: 'adesivo rotulo etiqueta embalagens' },
+  { when: /lacre|violac|seguranc|inviolavel/, add: 'lacre de seguranca' },
+  { when: /panfleto|folheto|flyer|volante|encarte/, add: 'panfletos flyers folhetos' },
+  { when: /cartaz|poster/, add: 'cartaz' },
+  { when: /calendario/, add: 'calendario' },
+  { when: /ima |imã|geladeira/, add: 'ima geladeira calendario com ima' },
+  { when: /bloco|comanda|pedido de mesa|via |vias/, add: 'blocos comandas vias' },
+  { when: /receituario|timbrado|medic|clinica|consultorio/, add: 'papel timbrado receituario' },
+  { when: /apostila|revista|livro|encaderna|curso/, add: 'apostila revista' },
+  { when: /certificado|diploma|formatura/, add: 'certificado' },
+  { when: /pasta/, add: 'pasta bolsa orelha' },
+  { when: /tatuagem/, add: 'tatuagem temporaria' },
+  { when: /foto|fotografia|revelar/, add: 'impressao foto quadro canvas' },
+  { when: /bandeira/, add: 'bandeira wind banner' },
+  { when: /placa|sinaliza|imobiliaria|corretor|aluga|vende-se/, add: 'placa pvc placa imobiliaria totem' },
+  { when: /viseira|ventarola|leque|abanador/, add: 'viseira ventarola' },
+  { when: /marcador de pagina|marca pagina/, add: 'marcador de pagina' },
+  { when: /festa|casamento|aniversario|batizado|noiv/, add: 'painel de festa tag cartao agradecimento adesivo rotulo' },
+  { when: /rifa/, add: 'rifa' },
+  { when: /wobbler|pdv|gondola|supermercado/, add: 'wobbler' },
+  { when: /troca de oleo|oficina|mecanic/, add: 'adesivo troca de oleo' },
+  { when: /escolar|volta as aulas|material escolar|caderno do/, add: 'etiqueta escolar' },
+  { when: /plotagem|planta|projeto|arquitet|engenhar/, add: 'plotagem' },
+  { when: /postal|post card/, add: 'postais' },
+  { when: /almofada/, add: 'capa de almofada' },
+  { when: /mouse ?pad/, add: 'mouse pad' },
+  { when: /caderno|anotac|agenda/, add: 'caderno bloco' },
+  { when: /palco|fundo de|backdrop|painel/, add: 'backdrop lona painel' },
+  { when: /pendurar|parede externa|muro|tapume/, add: 'banner lona faixa' },
+]
 
 function searchCatalog(query: string): string {
-  const words = normalize(query).split(/\s+/).filter(Boolean)
+  const raw = normalize(query)
+  if (!raw.trim()) return 'Termo de busca vazio.'
+
+  // Customer's own words, minus the ones that match everything.
+  const kept = raw.split(/\s+/).filter((w) => w && !SEARCH_STOPWORDS.has(w))
+  // Plus whatever this catalog calls the thing they described.
+  const intents = SEARCH_INTENTS.filter((r) => r.when.test(raw)).flatMap((r) => r.add.split(' '))
+  // If the phrase was nothing but stopwords, fall back to the raw words so we
+  // still search something instead of returning "nada encontrado".
+  const own = kept.length ? kept : raw.split(/\s+/).filter(Boolean)
+  // What the customer actually typed outranks what we inferred they meant, so a
+  // literal search for "crachá" still leads with Crachá de PVC even though the
+  // intent rule also pulls in cordão, pulseira and credencial.
+  const words: Array<{ w: string; weight: number }> = [
+    ...new Set(own),
+  ].map((w) => ({ w, weight: 1 }))
+  for (const w of new Set(intents)) {
+    if (!words.some((x) => x.w === w)) words.push({ w, weight: 0.5 })
+  }
   if (words.length === 0) return 'Termo de busca vazio.'
 
   const scored = CATALOG_ENTRIES.map((e) => {
@@ -129,34 +215,183 @@ function searchCatalog(query: string): string {
     // e.g. searching "botton" surfaces unrelated products that happen to
     // list "+2 bottons" as an accessory add-on, burying the actual Botton
     // products under ties.
-    const heading = normalize(`${e.category} ${e.subcategory} ${e.heading}`)
+    const name = normalize(e.heading)
+    const section = normalize(`${e.category} ${e.subcategory}`)
     const body = normalize(e.body)
     let score = 0
-    for (const w of words) {
-      if (heading.includes(w)) score += 5
+    for (const { w, weight } of words) {
+      let hit = 0
+      // The product's own name is the strongest signal. Its category is a much
+      // weaker one: the category "banners-e-faixas" contains the words "banner"
+      // and "faixa", so without this gap every product in it — a Placa
+      // Imobiliária included — tied with the actual Banner.
+      if (name.includes(w)) {
+        hit += 8
+        // A product whose name *starts* with the word usually IS the thing
+        // asked for, rather than something that merely mentions it: "Crachá de
+        // PVC" should beat "Cordão para crachá" on a search for "crachá".
+        if (name.startsWith(w)) hit += 4
+      } else if (section.includes(w)) hit += 3
       // Count repeated body mentions too (relevant products tend to repeat
       // the term across variations/tiers), but cap so one huge options list
-      // can't out-rank a real heading match.
+      // can't out-rank a real name match.
       const bodyHits = body.split(w).length - 1
-      score += Math.min(bodyHits, 3)
+      hit += Math.min(bodyHits, 3)
+      score += hit * weight
     }
     return { e, score }
   })
     .filter((r) => r.score > 0)
     .sort((a, b) => b.score - a.score)
-    .slice(0, MAX_SEARCH_RESULTS)
 
   if (scored.length === 0) {
     return `Nenhum produto encontrado para "${query}". Tente outra palavra-chave (nome do produto, categoria ou material).`
   }
 
-  let out = ''
+  // The same product often has a dozen entries (one per size or code). Showing
+  // all of them spends the whole budget on one product, so cap the repeats and
+  // let other products through.
+  // Group by the product name with its code stripped: the same product shows up
+  // both as "Quadro ... - Envie sua Foto" and "Quadro ... - Envie sua Foto
+  // (4FAB496E)", which would otherwise slip past the cap as different names.
+  // ...and also with the trailing size stripped, so "Cordão para crachá - 9mm"
+  // through "- 20mm" count as one product instead of filling every slot with
+  // the same item in four widths.
+  const baseName = (h: string) =>
+    h
+      .replace(/\s*\([0-9A-Za-z]+\)\s*$/, '')
+      .replace(/\s*[-–]?\s*\d+([.,]\d+)?\s*x\s*\d+([.,]\d+)?\s*(mm|cm|m)?\s*$/i, '')
+      .replace(/\s*[-–]?\s*\d+([.,]\d+)?\s*(mm|cm|m)\s*$/i, '')
+      .trim()
+  const seen = new Map<string, number>()
+  const top: CatalogEntry[] = []
+  const rest: CatalogEntry[] = []
   for (const { e } of scored) {
+    const key = baseName(e.heading)
+    const n = seen.get(key) ?? 0
+    if (n < MAX_PER_HEADING && top.length < MAX_SEARCH_RESULTS) {
+      seen.set(key, n + 1)
+      top.push(e)
+    } else {
+      rest.push(e)
+    }
+  }
+
+  let out = ''
+  for (const e of top) {
     const block = `### ${e.heading} [${e.category} / ${e.subcategory}]\n${e.body.trim()}\n\n`
     if (out.length + block.length > MAX_SEARCH_CHARS) break
     out += block
   }
+
+  // Names only (cheap) of other products that also matched, so the assistant
+  // knows what else exists and can search one of them specifically.
+  const others = [...new Set(rest.map((e) => baseName(e.heading)))].filter((h) => !seen.has(h)).slice(0, 12)
+  if (others.length) {
+    out += `Outros produtos que também combinam com essa busca (busque pelo nome pra ver preço e detalhes): ${others.join('; ')}\n`
+  }
   return out.trim()
+}
+
+// --- Sheet-sticker pricing (deterministic) ---
+//
+// "Folha Adesivo Personalizado" is priced BY SHEET, but customers ask in
+// stickers ("100 adesivos 6x6cm"). Getting from one to the other means: how many
+// fit on a 30x45cm sheet, how many sheets that needs, then the price tier for
+// THAT sheet count. The model got this wrong repeatedly — charging per sticker
+// (30x the real price), and quoting the 100-499 tier for a 5-sheet order — so
+// the arithmetic lives here instead of in the prompt.
+
+const SHEET_PRODUCT_CODE = 'A69E2B83'
+const SHEET_W_CM = 30
+const SHEET_H_CM = 45
+
+const SHEET_ENTRY = CATALOG_ENTRIES.find((e) => e.heading.includes(SHEET_PRODUCT_CODE))
+
+function parseBRL(s: string): number {
+  return Number(s.replace(/\./g, '').replace(',', '.'))
+}
+
+function brl(n: number): string {
+  const [int, dec] = n.toFixed(2).split('.')
+  return `R$ ${int.replace(/\B(?=(\d{3})+(?!\d))/g, '.')},${dec}`
+}
+
+const SHEET_TIERS: Array<{ min: number; max: number; price: number }> = (() => {
+  const line = SHEET_ENTRY?.body.split('\n').find((l) => l.includes('Preço por quantidade')) ?? ''
+  return [...line.matchAll(/(\d+)\s*-\s*(\d+)un:\s*R\$\s*([\d.,]+)/g)]
+    .map((m) => ({ min: Number(m[1]), max: Number(m[2]), price: parseBRL(m[3]) }))
+    .sort((a, b) => a.min - b.min)
+})()
+
+const SHEET_MATERIALS: Array<{ name: string; extra: number }> = (() => {
+  const line = SHEET_ENTRY?.body.split('\n').find((l) => l.includes('Opções:')) ?? ''
+  const out: Array<{ name: string; extra: number }> = []
+  for (const part of line.split(';')) {
+    const m = part.match(/\[material\]\s*([^(]+?)\s*(?:\(\+R\$\s*([\d.,]+)\))?\s*$/)
+    if (m) out.push({ name: m[1].trim(), extra: m[2] ? parseBRL(m[2]) : 0 })
+  }
+  return out
+})()
+
+function materialList(): string {
+  return SHEET_MATERIALS.map((m) => (m.extra ? `${m.name} (+${brl(m.extra)})` : m.name)).join('; ')
+}
+
+function quoteSheetStickers(larguraCm: number, alturaCm: number, quantidade: number, material?: string): string {
+  if (!SHEET_ENTRY || SHEET_TIERS.length === 0) {
+    return 'Não consegui ler a tabela desse produto no catálogo. Não estime o valor — diga que a equipe confirma o preço.'
+  }
+  if (!(larguraCm > 0) || !(alturaCm > 0) || !(quantidade > 0)) {
+    return 'Medidas ou quantidade inválidas. Peça ao cliente a largura e a altura em cm e a quantidade de adesivos.'
+  }
+
+  // Try the art both ways round on the sheet and keep whichever fits more.
+  const perSheet = Math.max(
+    Math.floor(SHEET_W_CM / larguraCm) * Math.floor(SHEET_H_CM / alturaCm),
+    Math.floor(SHEET_W_CM / alturaCm) * Math.floor(SHEET_H_CM / larguraCm),
+  )
+  if (perSheet < 1) {
+    return `Um adesivo de ${larguraCm}x${alturaCm}cm NÃO cabe na folha de ${SHEET_W_CM}x${SHEET_H_CM}cm, então esse pedido não é "Folha Adesivo Personalizado". É adesivo grande formato, cobrado por m²: busque "adesivo vinil metro quadrado" e cote por área.`
+  }
+
+  const folhas = Math.ceil(quantidade / perSheet)
+  const tier = SHEET_TIERS.find((t) => folhas >= t.min && folhas <= t.max)
+  if (!tier) {
+    const maior = SHEET_TIERS[SHEET_TIERS.length - 1].max
+    return `Esse pedido daria ${folhas} folhas, fora das faixas de preço do catálogo (vão até ${maior} folhas). Não estime nem faça regra de três — diga que a equipe confirma o preço dessa quantidade.`
+  }
+
+  let extra = 0
+  let materialName = SHEET_MATERIALS[0]?.name ?? 'material padrão'
+  if (material) {
+    const want = normalize(material)
+    const found =
+      SHEET_MATERIALS.find((m) => normalize(m.name) === want) ??
+      SHEET_MATERIALS.find((m) => normalize(m.name).includes(want) || want.includes(normalize(m.name)))
+    if (!found) {
+      return `O material "${material}" não existe nesse produto. Os reais são: ${materialList()}. Pergunte ao cliente qual desses ele quer (com mostrar_opcoes) antes de calcular.`
+    }
+    extra = found.extra
+    materialName = found.name
+  }
+
+  const unit = tier.price + extra
+  return [
+    'CÁLCULO OFICIAL DO SISTEMA — use exatamente estes números, não recalcule:',
+    `- Produto: Folha Adesivo Personalizado (${SHEET_PRODUCT_CODE}) — ${materialName}`,
+    `- Cabem ${perSheet} adesivos de ${larguraCm}x${alturaCm}cm na folha de ${SHEET_W_CM}x${SHEET_H_CM}cm`,
+    `- ${quantidade} adesivos ÷ ${perSheet} por folha = ${folhas} folha(s), arredondando pra cima`,
+    `- Faixa para ${folhas} folha(s): ${tier.min}-${tier.max} folhas a ${brl(tier.price)}/folha` +
+      (extra ? ` + ${brl(extra)} de ${materialName} = ${brl(unit)}/folha` : ''),
+    `- TOTAL: ${brl(unit * folhas)}`,
+    folhas >= 10 || quantidade >= 1000
+      ? '- Pedido grande: avise numa frase que a equipe confirma esse valor antes de fechar.'
+      : '- Pode fechar esse valor normalmente.',
+    material ? '' : `- O cliente ainda não escolheu material; este total usa "${materialName}". Materiais reais: ${materialList()}`,
+  ]
+    .filter(Boolean)
+    .join('\n')
 }
 
 const AI_TOOLS: Anthropic.Messages.Tool[] = [
@@ -214,6 +449,30 @@ const AI_TOOLS: Anthropic.Messages.Tool[] = [
       },
       required: ['pergunta', 'opcoes'],
     },
+  },
+  {
+    name: 'calcular_folha_adesivo',
+    description:
+      'Calcula o preço exato de adesivos cortados em folha ("Folha Adesivo Personalizado"): quantos cabem na folha de 30x45cm, quantas folhas o pedido precisa, a faixa de preço correta pra esse número de folhas, e o total. Use SEMPRE que o cliente pedir adesivo personalizado por quantidade e tamanho (ex: "100 adesivos 6x6cm") — nunca faça essa conta de cabeça nem reaproveite um preço de outra mensagem da conversa. Os números que essa ferramenta devolve são os oficiais: repita eles como vieram.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        largura_cm: { type: 'number', description: 'Largura do adesivo em centímetros' },
+        altura_cm: { type: 'number', description: 'Altura do adesivo em centímetros' },
+        quantidade: { type: 'number', description: 'Quantos ADESIVOS o cliente quer (não folhas)' },
+        material: {
+          type: 'string',
+          description: 'Material escolhido pelo cliente, ex: "Vinil Adesivo Brilho". Deixe vazio se ele ainda não escolheu.',
+        },
+      },
+      required: ['largura_cm', 'altura_cm', 'quantidade'],
+    },
+  },
+  {
+    name: 'oferecer_fechamento',
+    description:
+      'Envia, logo depois da sua mensagem, os botões "✅ Fechar pedido / 🔁 Outro produto / 💬 Falar com equipe". Use SOMENTE quando o orçamento já estiver completo E você não estiver esperando o cliente responder nada. Se a sua mensagem termina com uma pergunta (qual material, tem arte pronta, qual tamanho, etc), NÃO chame — espere ele responder primeiro, senão os botões atropelam a pergunta.',
+    input_schema: { type: 'object', properties: {} },
   },
 ]
 
@@ -575,6 +834,30 @@ function buildHistory(chatId: string, beforeTs: number): Anthropic.Messages.Mess
 // just a safety net against the model looping, not a normal-case limit.
 const MAX_TOOL_ROUNDS = 4
 
+function textOf(content: Anthropic.Messages.ContentBlock[]): string {
+  return content
+    .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
+    .map((b) => b.text)
+    .join('\n')
+    .trim()
+}
+
+// Runs a tool the model asked for and returns the text that goes back to it as
+// the tool result. Only the tools that feed information back come through here —
+// `mostrar_opcoes` and `oferecer_fechamento` end the turn instead.
+function runAiTool(tu: Anthropic.Messages.ToolUseBlock): string {
+  const input = (tu.input ?? {}) as Record<string, unknown>
+  if (tu.name === 'calcular_folha_adesivo') {
+    return quoteSheetStickers(
+      Number(input.largura_cm),
+      Number(input.altura_cm),
+      Number(input.quantidade),
+      typeof input.material === 'string' && input.material.trim() ? input.material : undefined,
+    )
+  }
+  return searchCatalog(typeof input.termo === 'string' ? input.termo : '')
+}
+
 async function handleWithAI(chatId: string, wamid: string, userText: string, ts: number, pushName?: string): Promise<void> {
   try {
     const messages: Anthropic.Messages.MessageParam[] = [
@@ -606,11 +889,7 @@ async function handleWithAI(chatId: string, wamid: string, userText: string, ts:
       )
 
       if (toolUses.length === 0) {
-        replyText = response.content
-          .filter((b): b is Anthropic.Messages.TextBlock => b.type === 'text')
-          .map((b) => b.text)
-          .join('\n')
-          .trim()
+        replyText = textOf(response.content)
         break
       }
 
@@ -623,30 +902,38 @@ async function handleWithAI(chatId: string, wamid: string, userText: string, ts:
         return
       }
 
+      // `oferecer_fechamento` is the model saying "the quote is done and I'm not
+      // waiting on an answer" — send whatever text came with it, then the close
+      // buttons. This replaced an automatic "reply mentions R$" trigger, which
+      // fired even when the reply ended in a question and talked over it.
+      const offerClose = toolUses.find((tu) => tu.name === 'oferecer_fechamento')
+      if (offerClose) {
+        const text = textOf(response.content)
+        if (text) {
+          const sent = await sendText(chatId, text, wamid)
+          if (!sent.ok) console.error('ai: send failed:', sent.data)
+        }
+        await offersOrderButtons(chatId)
+        return
+      }
+
       messages.push({ role: 'assistant', content: response.content })
       messages.push({
         role: 'user',
-        content: toolUses.map((tu) => {
-          const termo = typeof tu.input === 'object' && tu.input && 'termo' in tu.input ? String((tu.input as { termo: unknown }).termo) : ''
-          return {
-            type: 'tool_result' as const,
-            tool_use_id: tu.id,
-            content: searchCatalog(termo),
-          }
-        }),
+        content: toolUses.map((tu) => ({
+          type: 'tool_result' as const,
+          tool_use_id: tu.id,
+          content: runAiTool(tu),
+        })),
       })
     }
 
     if (!replyText) return
 
+    // No automatic close buttons here: the model asks for them with
+    // `oferecer_fechamento` when the conversation is actually at that point.
     const result = await sendText(chatId, replyText, wamid)
-    if (!result.ok) {
-      console.error('ai: send failed:', result.data)
-    } else if (/R\$\s?\d/.test(replyText)) {
-      // The reply quotes a price — offer the same close/browse/human buttons the
-      // guided menu shows, so the customer doesn't have to type "pedido" to get them.
-      await offersOrderButtons(chatId)
-    }
+    if (!result.ok) console.error('ai: send failed:', result.data)
   } catch (err) {
     console.error('ai: handling failed:', err)
   }
