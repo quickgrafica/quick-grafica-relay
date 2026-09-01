@@ -246,6 +246,28 @@ function realVariations(e: CatalogEntry): Array<{ key: string; values: string[] 
   return out.filter((v) => !out.some((other) => other.key !== v.key && determined(v.key, other.key)))
 }
 
+// The snapshot holds entries with an identical spec sheet but different price
+// tables — "Cartão de visita Promocional 9x5cm Couchê 300g 4x1" exists at both
+// R$ 104,90 and R$ 114,90 for 1000un. The export dropped whatever column told
+// them apart (the site also asks for revestimento and acabamento), so from here
+// they are indistinguishable and picking one would be a coin flip on the
+// customer's money. Say so instead.
+function conflictingPrices(e: CatalogEntry): string[] {
+  const f = FACTS.get(e)
+  if (!f) return []
+  const sig = (x: CatalogEntry) =>
+    SPEC_KEYS.map((k) => normalize(FACTS.get(x)?.specs.get(k) ?? '')).join('|')
+  const mine = sig(e)
+  const others = siblingsOf(e).filter((s) => s !== e && sig(s) === mine)
+  const priceOf = (x: CatalogEntry) => (FACTS.get(x)?.priceLines ?? []).join(' ')
+  const distinct = new Set<string>()
+  for (const o of others) {
+    const p = priceOf(o)
+    if (p && p !== priceOf(e)) distinct.add(p)
+  }
+  return [...distinct]
+}
+
 // Renders one product the way the assistant should reason about it.
 function describeEntry(e: CatalogEntry): string {
   const f = FACTS.get(e) ?? parseFacts(e)
@@ -272,6 +294,14 @@ function describeEntry(e: CatalogEntry): string {
       ? `ESCOLHAS REAIS deste produto (s\u00f3 estas, nada al\u00e9m): ${choices.join(' || ')}`
       : 'ESCOLHAS REAIS deste produto: NENHUMA \u2014 n\u00e3o h\u00e1 nada pra escolher aqui, \u00e9 s\u00f3 confirmar quantidade.',
   )
+
+  const conflicts = conflictingPrices(e)
+  if (conflicts.length) {
+    lines.push(
+      `\u26a0\ufe0f PRE\u00c7O EM CONFLITO: o cat\u00e1logo tem outra(s) tabela(s) de pre\u00e7o para exatamente esta mesma ficha \u2014 ${conflicts.join(' | ')}. ` +
+        'N\u00c3O escolha uma delas e N\u00c3O d\u00ea valor fechado. Diga ao cliente que confirma o pre\u00e7o exato desse item com a equipe antes de fechar.',
+    )
+  }
   return lines.join('\n') + '\n\n'
 }
 
@@ -1496,6 +1526,75 @@ app.post('/mark-read', async (c) => {
 app.get('/log', (c) => {
   if (c.req.query('token') !== DASHBOARD_TOKEN) return c.json({ error: 'unauthorized' }, 401)
   return c.json({ log })
+})
+
+// --- Quick Gráfica product API: shape probe ---
+//
+// Step one of replacing the static catalog snapshot. The sandbox this was
+// written in can't reach the API, and guessing a JSON shape means writing a
+// parser against an imaginary contract. So this endpoint calls the API from the
+// server that CAN reach it and reports back what actually came: status, the
+// top-level keys, how many products, and one sample product with its fields.
+// The real importer gets written against that. Reads credentials from the
+// environment — the token never goes near the repository, and is never echoed
+// back in the response.
+app.get('/api-check', async (c) => {
+  if (c.req.query('token') !== DASHBOARD_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+
+  const url = process.env.QUICK_API_URL
+  const apiToken = process.env.QUICK_API_TOKEN
+  if (!url || !apiToken) {
+    return c.json({
+      erro: 'Faltam variáveis de ambiente no Railway.',
+      necessarias: {
+        QUICK_API_URL: url ? 'ok' : 'FALTANDO — ex: https://www.quickgrafica.com.br/api-v1/produtos',
+        QUICK_API_TOKEN: apiToken ? 'ok' : 'FALTANDO — o Bearer token, sem a palavra "Bearer"',
+      },
+    })
+  }
+
+  try {
+    const res = await fetch(url, {
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiToken}` },
+    })
+    const raw = await res.text()
+
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(raw)
+    } catch {
+      return c.json({
+        status: res.status,
+        aviso: 'A resposta não é JSON. Primeiros 800 caracteres:',
+        amostra: raw.slice(0, 800),
+      })
+    }
+
+    // Find the array of products wherever it happens to live.
+    let list: unknown[] | null = Array.isArray(parsed) ? parsed : null
+    let listaEm = list ? '(raiz)' : ''
+    if (!list && parsed && typeof parsed === 'object') {
+      for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+        if (Array.isArray(v)) {
+          list = v
+          listaEm = k
+          break
+        }
+      }
+    }
+
+    const sample = list?.[0]
+    return c.json({
+      status: res.status,
+      chavesNoTopo: parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? Object.keys(parsed) : '(a raiz é uma lista)',
+      listaEm,
+      quantidadeDeProdutos: list?.length ?? 0,
+      camposDeUmProduto: sample && typeof sample === 'object' ? Object.keys(sample as object) : null,
+      exemploDeProduto: sample ?? null,
+    })
+  } catch (err) {
+    return c.json({ erro: 'A chamada falhou', detalhe: String(err) })
+  }
 })
 
 // The review queue: conversations with something worth a human's eyes, and why.
