@@ -81,6 +81,11 @@ function parseCatalog(text: string): CatalogEntry[] {
       entries.push(current)
     } else if (line.startsWith('## ')) {
       category = line.replace(/^##\s*/, '').trim()
+      // Reset: a category with no subcategory headers of its own (cartões de
+      // visita, impressão foto) was inheriting the last one seen, which filed
+      // every business card under "wind-banner" and broke the grouping of a
+      // product with its own variations.
+      subcategory = ''
       current = null
     } else if (line.startsWith('#')) {
       current = null
@@ -114,6 +119,160 @@ function normalize(s: string): string {
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
+}
+
+// --- What is a real choice, and what already comes fixed ---
+//
+// The recurring bug in production was always the same shape: the assistant
+// offering as a choice something that is simply how the product is made. It
+// asked "4x0 ou 4x4?" for a Backdrop that only exists in 4x0; "frente ou frente
+// e verso?" for a sticker printed on one side; "quer bast\u00e3o e cordinha?" for a
+// Banner that always ships with it. Prompt rules only reduced how often it
+// guessed wrong, because the raw catalog text gives it nothing to tell the two
+// apart. So the search result now states it outright, per product: these fields
+// are FIXED, and these are the only real choices \u2014 the ones on the "Op\u00e7\u00f5es:"
+// line, plus whatever genuinely differs between sibling entries of the same
+// product (Banner's eight sizes, for instance).
+
+const SPEC_KEYS = ['Formato', 'Material', 'Acabamento', 'Cores/Impress\u00e3o', 'Prazo']
+
+interface EntryFacts {
+  specs: Map<string, string>
+  options: string
+  priceLines: string[]
+  simplePrice: string
+}
+
+function parseFacts(e: CatalogEntry): EntryFacts {
+  const specs = new Map<string, string>()
+  const priceLines: string[] = []
+  let options = ''
+  let simplePrice = ''
+
+  for (const rawLine of e.body.split('\n')) {
+    const line = rawLine.replace(/^\s*-\s*/, '').trim()
+    if (!line) continue
+    if (line.startsWith('Op\u00e7\u00f5es:')) {
+      options = line.replace('Op\u00e7\u00f5es:', '').trim()
+    } else if (/^(Pre\u00e7o|Desconto|Limites)/i.test(line)) {
+      priceLines.push(line)
+      const m = line.match(/^Pre\u00e7o:\s*(R\$\s*[\d.,]+)/i)
+      if (m) simplePrice = m[1]
+    } else if (line.includes(':')) {
+      for (const part of line.split('|')) {
+        const idx = part.indexOf(':')
+        if (idx === -1) continue
+        const key = part.slice(0, idx).trim()
+        const value = part.slice(idx + 1).trim()
+        if (SPEC_KEYS.includes(key) && value) specs.set(key, value)
+      }
+    }
+  }
+  return { specs, options, priceLines, simplePrice }
+}
+
+const FACTS = new Map<CatalogEntry, EntryFacts>()
+for (const e of CATALOG_ENTRIES) FACTS.set(e, parseFacts(e))
+
+// Sibling entries = the same product under different codes/sizes. A spec that
+// changes across them is a genuine choice the customer gets to make; one that
+// holds steady across all of them is just how the product is.
+const productBaseName = (h: string) =>
+  h
+    .replace(/\s*\([0-9A-Za-z]+\)\s*$/, '')
+    .replace(/\s*[-\u2013]?\s*\d+([.,]\d+)?\s*x\s*\d+([.,]\d+)?\s*(mm|cm|m)?\s*$/i, '')
+    .replace(/\s*[-\u2013]?\s*\d+([.,]\d+)?\s*(mm|cm|m)\s*$/i, '')
+    .trim()
+
+const SIBLINGS = new Map<string, CatalogEntry[]>()
+for (const e of CATALOG_ENTRIES) {
+  const key = `${e.category}/${e.subcategory}/${normalize(productBaseName(e.heading))}`
+  if (!SIBLINGS.has(key)) SIBLINGS.set(key, [])
+  SIBLINGS.get(key)!.push(e)
+}
+
+function siblingsOf(e: CatalogEntry): CatalogEntry[] {
+  return SIBLINGS.get(`${e.category}/${e.subcategory}/${normalize(productBaseName(e.heading))}`) ?? [e]
+}
+
+// Only collapses values that are literally the same thing typed differently
+// ("8 x8 cm" vs "8 x 8 cm"). Deliberately NOT fuzzy: an earlier version scored
+// word overlap and merged 4x0, 4x1 and 4x4 into one value, because all three
+// phrasings share "colorido frente verso" — erasing a real choice. The
+// different-wording case (Banner's two ways of saying bastão e cordinha) is
+// handled below by checking whether the field is decided by another one.
+function sameValue(a: string, b: string): boolean {
+  const clean = (s: string) =>
+    normalize(s).replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim().replace(/ /g, '')
+  return clean(a) === clean(b)
+}
+
+// Which spec keys actually vary between siblings, and the values on offer.
+function realVariations(e: CatalogEntry): Array<{ key: string; values: string[] }> {
+  const group = siblingsOf(e)
+  if (group.length < 2) return []
+  const out: Array<{ key: string; values: string[] }> = []
+  for (const key of SPEC_KEYS) {
+    if (key === 'Prazo') continue // production time isn't something the customer picks
+    const distinct: Array<{ value: string; price: string }> = []
+    for (const sib of group) {
+      const v = FACTS.get(sib)?.specs.get(key)
+      if (!v) continue
+      if (distinct.some((d) => sameValue(d.value, v))) continue
+      distinct.push({ value: v, price: FACTS.get(sib)?.simplePrice ?? '' })
+    }
+    if (distinct.length > 1) {
+      out.push({ key, values: distinct.map((d) => (d.price ? `${d.value} (${d.price})` : d.value)) })
+    }
+  }
+
+  // Drop keys the customer doesn't actually get to pick. Every Banner size
+  // carries its own wording of the same finish, so "Acabamento" looks like it
+  // varies — but pick the size and the finish is already decided. When one key
+  // is fully determined by another, it is a description of that version, not a
+  // separate question to ask.
+  const determined = (key: string, by: string): boolean => {
+    const map = new Map<string, string>()
+    for (const sib of group) {
+      const k = FACTS.get(sib)?.specs.get(key)
+      const b = FACTS.get(sib)?.specs.get(by)
+      if (!k || !b) continue
+      const prev = map.get(b)
+      if (prev && !sameValue(prev, k)) return false
+      if (!prev) map.set(b, k)
+    }
+    return map.size > 1
+  }
+  return out.filter((v) => !out.some((other) => other.key !== v.key && determined(v.key, other.key)))
+}
+
+// Renders one product the way the assistant should reason about it.
+function describeEntry(e: CatalogEntry): string {
+  const f = FACTS.get(e) ?? parseFacts(e)
+  const variations = realVariations(e)
+  const varyingKeys = new Set(variations.map((v) => v.key))
+
+  const fixed = SPEC_KEYS.filter((k) => f.specs.has(k) && !varyingKeys.has(k))
+    .map((k) => `${k}: ${f.specs.get(k)}`)
+    .join(' | ')
+  const thisOne = SPEC_KEYS.filter((k) => varyingKeys.has(k) && f.specs.has(k))
+    .map((k) => `${k}: ${f.specs.get(k)}`)
+    .join(' | ')
+
+  const lines = [`### ${e.heading} [${e.category} / ${e.subcategory}]`]
+  if (fixed) lines.push(`J\u00c1 VEM ASSIM (fixo \u2014 nunca pergunte como se fosse escolha): ${fixed}`)
+  if (thisOne) lines.push(`ESTA VERS\u00c3O: ${thisOne}`)
+  for (const p of f.priceLines) lines.push(p)
+
+  const choices: string[] = []
+  if (f.options) choices.push(f.options)
+  for (const v of variations) choices.push(`[${v.key}] ${v.values.join('; ')}`)
+  lines.push(
+    choices.length
+      ? `ESCOLHAS REAIS deste produto (s\u00f3 estas, nada al\u00e9m): ${choices.join(' || ')}`
+      : 'ESCOLHAS REAIS deste produto: NENHUMA \u2014 n\u00e3o h\u00e1 nada pra escolher aqui, \u00e9 s\u00f3 confirmar quantidade.',
+  )
+  return lines.join('\n') + '\n\n'
 }
 
 const MAX_SEARCH_RESULTS = 8
@@ -279,7 +438,7 @@ function searchCatalog(query: string): string {
 
   let out = ''
   for (const e of top) {
-    const block = `### ${e.heading} [${e.category} / ${e.subcategory}]\n${e.body.trim()}\n\n`
+    const block = describeEntry(e)
     if (out.length + block.length > MAX_SEARCH_CHARS) break
     out += block
   }
