@@ -7,14 +7,17 @@
     "start": "node --import tsx relay.ts",
     "typecheck": "tsc --noEmit"
   },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "hono": "^4",
     "@hono/node-server": "^1",
-    "@anthropic-ai/sdk": "^0.122"
+    "@anthropic-ai/sdk": "^0.122",
+    "tsx": "^4"
   },
   "devDependencies": {
     "typescript": "^5",
-    "@types/node": "^22",
-    "tsx": "^4"
+    "@types/node": "^22"
   }
 }
