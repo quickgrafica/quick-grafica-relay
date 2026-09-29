@@ -2495,7 +2495,7 @@ interface LogEntry {
   // 'eco': a message the business sent from the WhatsApp Business app on a
   // number that also runs on the API (a person on the phone, or Meta's own
   // agent) — Meta reports those as smb_message_echoes. Absent = sent by us.
-  origem?: 'eco'
+  origem?: 'eco' | 'sombra'
 }
 
 const DATA_DIR = process.env.DATA_DIR ?? '.'
@@ -2555,11 +2555,9 @@ let logSeq = log.reduce((max, e) => (typeof e.seq === 'number' && e.seq > max ? 
 // "everything written before this message".
 function logMessage(entry: LogEntry): number {
   // On a shadow number, what Sophia "sent" never reached the customer (waApi
-  // stored it for /sombra instead). Keeping it out of the log keeps her
-  // history equal to the conversation the customer really had: their
-  // messages plus the replies that actually went out (the echoes) — so each
-  // suggestion answers the real situation, not a conversation that never was.
-  if (entry.direction === 'out' && entry.origem !== 'eco' && emSombra(entry.chatId)) return logSeq
+  // stored it for /sombra instead). It is still logged, tagged 'sombra', so
+  // her next suggestion continues her own conversation (see LogEntry.origem).
+  if (entry.direction === 'out' && entry.origem !== 'eco' && emSombra(entry.chatId)) entry.origem = 'sombra'
   entry.seq = ++logSeq
   log.push(entry)
   if (log.length > MAX_LOG) {
@@ -4165,7 +4163,7 @@ function parseMessages(payload: WaWebhookPayload): Promise<void>[] {
         // shape only — no message content), so a new kind of delivery, like the
         // way Meta's agent reports its own replies, can be recognised and handled.
         const v = (raw ?? {}) as Record<string, unknown>
-        const soStatus = Object.keys(v).every((k) => ['messaging_product', 'metadata', 'statuses'].includes(k))
+        const soStatus = Object.keys(v).every((k) => ['messaging_product', 'metadata', 'statuses', 'contacts'].includes(k))
         if (!soStatus) {
           const forma = (o: unknown): string =>
             o && typeof o === 'object' && !Array.isArray(o)
@@ -5029,6 +5027,8 @@ function conversasSombra(chatFiltro?: string): Array<{ chatId: string; nome?: st
   }
   for (const e of log) {
     if (!emSombra(e.chatId) || (chatFiltro && e.chatId !== chatFiltro)) continue
+    // Sophia's own suggestions come from `sombra` below (with buttons spelled out).
+    if (e.origem === 'sombra') continue
     const c = pegar(e.chatId)
     if (e.pushName) c.nome = e.pushName
     c.itens.push({ quem: e.direction === 'in' ? 'cliente' : 'enviado', texto: e.text, timestamp: e.timestamp })
@@ -5100,7 +5100,7 @@ app.get('/sombra', (c) => {
   if (!NUMEROS_SOMBRA.size) avisos.push('Nenhum número em modo sombra. Configure WHATSAPP_NUMEROS_SOMBRA no Railway.')
   else if (!conversas.length) avisos.push('Nenhuma mensagem chegou ainda dos números em sombra. Confira se o app está inscrito na conta do WhatsApp desse número.')
   else if (total('cliente') > 0 && total('enviado') === 0)
-    avisos.push('As respostas enviadas pelo número ainda não aparecem. Confira se o campo "smb_message_echoes" está assinado no webhook do app.')
+    avisos.push('A Meta não repassa o texto das respostas do agente dela (só avisa que foram entregues). Compare as sugestões da Sophia com a conversa no celular. Respostas digitadas pela equipe no app aparecem aqui em verde.')
   const blocos = conversas
     .map((cv) => {
       const { to } = splitChat(cv.chatId)
