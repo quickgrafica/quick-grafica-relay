@@ -482,6 +482,8 @@ const productBaseName = (h: string) =>
     .trim()
 
 let SIBLINGS = new Map<string, CatalogEntry[]>()
+// Live-API registrations grouped by identical spec sheet (see apiSpecKey).
+let API_TWINS = new Map<string, ApiProduct[]>()
 
 function siblingsOf(e: CatalogEntry): CatalogEntry[] {
   return SIBLINGS.get(`${e.category}/${e.subcategory}/${normalize(productBaseName(e.heading))}`) ?? [e]
@@ -506,11 +508,20 @@ function indexCatalog(entries: CatalogEntry[]): void {
     siblings.get(key)!.push(e)
   }
 
+  const twins = new Map<string, ApiProduct[]>()
+  for (const e of entries) {
+    if (!e.api) continue
+    const key = apiSpecKey(e.api)
+    if (!twins.has(key)) twins.set(key, [])
+    twins.get(key)!.push(e.api)
+  }
+
   const overview = buildOverview(entries)
 
   CATALOG_ENTRIES = entries
   FACTS = facts
   SIBLINGS = siblings
+  API_TWINS = twins
   CATALOG_OVERVIEW = overview
 }
 
@@ -613,6 +624,59 @@ const PRODUTOS_DESCARTADOS = new Set(['banner padrao', 'banner metro quadrado', 
 function isArchived(p: ApiProduct): boolean {
   const a = p.arquivado
   return a === 1 || a === '1' || a === true
+}
+
+// Ticked "Oculto" under "Onde o produto ficará visível?" in the shop's admin,
+// which the API reports as 5 in `visivel` (checked against the admin on
+// 04/10/2026: product 677, a Mother's Day mug, has only Oculto ticked and
+// carries exactly [5]; a product with every other box ticked carries 0-4).
+// Hidden means the shop took it off sale without deleting it — eleven seasonal
+// products at the time — and the assistant was still offering them, because
+// only `arquivado` was checked. The value arrives as an array from the API and
+// as "2,3" in the shop's CSV export, so both are read.
+function isHidden(p: ApiProduct): boolean {
+  const v = p.visivel
+  const list: unknown[] = Array.isArray(v) ? v : typeof v === 'string' ? v.split(',') : v == null ? [] : [v]
+  return list.some((x) => String(x).trim() === '5')
+}
+
+// Two registrations with an identical spec sheet and different price tables.
+// "Cartão de visita Premium" 9x5cm, Couchê 300g, laminação fosca frente e
+// verso, 4x4 exists as id 60 (1000un R$ 189,90 — the one the site sells) and as
+// id 526 (1000un R$ 105,00). The assistant quoted R$ 105,00 and, asked by the
+// customer to double-check, confirmed it: from where it stood the number really
+// was in the system. Nothing in the data says which registration is the right
+// one, so neither is quoted and the price goes to the team — the same rule the
+// snapshot path already applies through conflictingPrices().
+//
+// Every spec field takes part in the key, including acabamento and extras:
+// "Folhas soltas" vs "Blocado" or "Sem Enchimento" vs "Com Enchimento" are
+// different products with rightly different prices, not conflicts.
+function apiSpecKey(p: ApiProduct): string {
+  return [p.titulo, p.formato, p.material, p.revestimento, p.cores, p.acabamento, p.extras]
+    .map((v) => normalize(String(v ?? '')).replace(/\s+/g, ' ').trim())
+    .join('|')
+}
+
+function apiPriceText(p: ApiProduct): string {
+  return priceTiers(p).map(tierLabel).join('; ') || priceRules(p)
+}
+
+// The other registrations of this exact product that carry a different price.
+// (API_TWINS is declared up with SIBLINGS: indexCatalog() runs at module load,
+// before execution reaches this point, and assigns it.)
+function apiPriceConflicts(p: ApiProduct): ApiProduct[] {
+  const mine = apiPriceText(p)
+  return (API_TWINS.get(apiSpecKey(p)) ?? []).filter((o) => o !== p && apiPriceText(o) !== mine)
+}
+
+function apiConflictWarning(p: ApiProduct): string {
+  const outros = apiPriceConflicts(p)
+  if (!outros.length) return ''
+  return (
+    `⚠️ PREÇO EM CONFLITO: o catálogo tem outra(s) tabela(s) de preço para exatamente esta mesma ficha — ${outros.map((o) => apiPriceText(o) || 'sem preço').join(' | ')}. ` +
+    'NÃO escolha uma delas e NÃO dê valor fechado. Diga ao cliente que confirma o preço exato desse item com a equipe antes de fechar.'
+  )
 }
 const CATALOG_REFRESH_MS = 6 * 60 * 60 * 1000
 
@@ -826,7 +890,7 @@ function compararPrecos(termo: string, larguraCm: number, alturaCm: number, quan
     for (const c of cands) {
       const preco = priceAtQty(c.tiers, q)
       if (preco == null) continue
-      const suspeito = tierWarning(c.tiers).includes(`${q}un`)
+      const suspeito = tierWarning(c.tiers).includes(`${q}un`) || apiPriceConflicts(c.e.api!).length > 0
       ;(c.exact ? exatos : proximos).push({ e: c.e, dims: c.dims, preco, suspeito })
     }
     exatos.sort((a, b) => a.preco - b.preco)
@@ -973,6 +1037,8 @@ function calcularMetroQuadrado(produto: string, larguraCm: number, alturaCm: num
     return `"${produto}" bate com mais de um produto: ${opts}. Chame de novo com o nome exato do que o cliente quer (se não souber qual, pergunte a ele).`
   }
   const alvo = top[0]
+  const conflito = apiConflictWarning(alvo.p)
+  if (conflito) return `Produto: ${alvo.p.titulo}${alvo.p.formato ? ` (${alvo.p.formato})` : ''}\n${conflito}`
   const q = quoteM2(alvo.cfg, larguraCm, alturaCm, quantidade)
   return `Produto: ${alvo.p.titulo}${alvo.p.formato ? ` (${alvo.p.formato})` : ''}\n${q.texto}`
 }
@@ -1211,6 +1277,8 @@ let lastGoodCount = 0
 // How many times in a row a load was rejected for shrinking too much.
 let shrinkRejections = 0
 const SHRINK_GRACE = 3
+// Products the last load left out for being marked "Oculto" in the shop.
+let hiddenSkipped = 0
 // In-flight refresh, so two callers never load concurrently.
 let refreshInFlight: Promise<{ ok: boolean; produtos: number; erro?: string }> | null = null
 
@@ -1239,9 +1307,11 @@ async function loadCatalogFromApi(forcar = false): Promise<{ ok: boolean; produt
         p.titulo.trim() &&
         !PRODUTOS_DESCARTADOS.has(normalize(p.titulo.trim())) &&
         !isArchived(p) &&
+        !isHidden(p) &&
         (priceTiers(p).length > 0 || m2Config(p) !== null || asArray<ApiVariation>(p.variacoes).length > 0),
     )
     if (usable.length === 0) throw new Error('a API respondeu, mas sem produtos utilizáveis')
+    hiddenSkipped = all.filter((p) => p && !isArchived(p) && isHidden(p)).length
 
     // A load that comes back drastically smaller than the last good one is
     // almost certainly a truncated response, not hundreds of products being
@@ -1357,6 +1427,9 @@ function describeApiEntry(e: CatalogEntry, p: ApiProduct): string {
     lines.push('PREÇO: não veio — confirme com a equipe, não estime.')
   }
 
+  const conflito = apiConflictWarning(p)
+  if (conflito) lines.push(conflito)
+
   // Group the options by what they're choosing, so each group becomes one
   // question instead of a mixed list.
   const groups = new Map<string, string[]>()
@@ -1412,10 +1485,10 @@ function describeEntry(e: CatalogEntry): string {
   // this path still said "J\u00c1 VEM ASSIM (fixo \u2014 nunca pergunte\u2026)" while the
   // instructions taught "FIXO:" \u2014 so whenever the API was down and this
   // fallback took over, the assistant met labels nothing had told it about.
-  // (Two markers are still path-specific by nature: ESTA VERS\u00c3O / \u26a0\ufe0f PRE\u00c7O EM
-  // CONFLITO can only be derived from the snapshot's sibling entries, and the
-  // per-unit vs one-off surcharge split only exists in the API's data. Both are
-  // documented as such in instrucoes.md.)
+  // (Two markers are still path-specific by nature: ESTA VERS\u00c3O can only be
+  // derived from the snapshot's sibling entries, and the per-unit vs one-off
+  // surcharge split only exists in the API's data. Both are documented as such
+  // in instrucoes.md. \u26a0\ufe0f PRE\u00c7O EM CONFLITO is raised on both paths.)
   const lines = [`### ${e.heading} [${e.category} / ${e.subcategory}]`]
   if (fixed) lines.push(`FIXO: ${fixed}`)
   if (thisOne) lines.push(`ESTA VERS\u00c3O: ${thisOne}`)
@@ -4934,6 +5007,49 @@ app.get('/precos-suspeitos', (c) => {
     encontrados: itens.length,
     deUmTotalDe: CATALOG_ENTRIES.length,
     itens,
+  })
+})
+
+// Registrations that are the same product twice with different prices — the
+// list to clean up in the shop's admin. Until one of each pair is removed or
+// renamed there, the assistant refuses to quote either (⚠️ PREÇO EM CONFLITO).
+// ?familia=cartao narrows to matching product names.
+app.get('/duplicados', (c) => {
+  if (c.req.query('token') !== DASHBOARD_TOKEN) return c.json({ error: 'unauthorized' }, 401)
+
+  const familia = normalize(c.req.query('familia') ?? '')
+  const grupos: Array<Record<string, unknown>> = []
+  for (const twins of API_TWINS.values()) {
+    if (twins.length < 2) continue
+    if (new Set(twins.map(apiPriceText)).size < 2) continue
+    const p = twins[0]
+    if (familia && !normalize(p.titulo).includes(familia)) continue
+    grupos.push({
+      produto: p.titulo,
+      formato: p.formato ?? null,
+      material: p.material ?? null,
+      revestimento: p.revestimento ?? null,
+      cores: p.cores ?? null,
+      acabamento: p.acabamento ?? null,
+      extras: p.extras ?? null,
+      cadastros: twins.map((t) => ({
+        id: t.id,
+        titulo: t.titulo,
+        prazo: t.prazo ?? null,
+        preco: apiPriceText(t) || '(sem preço)',
+        visivel: t.visivel ?? null,
+        url: t.url ?? null,
+      })),
+    })
+  }
+
+  return c.json({
+    fonte: catalogSource,
+    filtro: c.req.query('familia') ?? '(todos)',
+    gruposEmConflito: grupos.length,
+    ocultosIgnorados: hiddenSkipped,
+    deUmTotalDe: CATALOG_ENTRIES.length,
+    grupos,
   })
 })
 
