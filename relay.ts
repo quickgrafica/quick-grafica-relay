@@ -3607,8 +3607,8 @@ const CLOSE_PROMPTS = [
 ]
 let closePromptIdx = 0
 
-function offersOrderButtons(chatId: string): Promise<{ ok: boolean; status: number; data: unknown }> {
-  const body = CLOSE_PROMPTS[closePromptIdx++ % CLOSE_PROMPTS.length]
+function offersOrderButtons(chatId: string, pergunta?: string): Promise<{ ok: boolean; status: number; data: unknown }> {
+  const body = pergunta?.trim() || CLOSE_PROMPTS[closePromptIdx++ % CLOSE_PROMPTS.length]
   return sendButtons(chatId, body, [
     { id: 'wiz|close', title: '✅ Fechar pedido' },
     { id: 'wiz|outro', title: '🔁 Outro produto' },
@@ -3999,6 +3999,69 @@ const COBRAR_BOTOES =
   '(preço na descrição quando souber). Se a resposta for mesmo livre — o cliente precisa digitar algo que não cabe em opções —, ' +
   'repita exatamente o mesmo texto.'
 
+// The quote the model writes ends with its own closing question ("Fecho assim
+// ou quer ajustar algo?") and the close buttons then arrived with a second one
+// ("Fechamos assim?") — two confirmation questions back to back on every quote.
+// A button message needs a body text anyway, so the model's question becomes
+// that body instead of being asked twice.
+const PERGUNTA_DE_FECHAMENTO = /fech(o|amos|ar)\b|seguir com (esse|o) pedido|seguimos|ajustar algo|posso seguir/i
+function separarFechamento(text: string): { corpo: string; pergunta?: string } {
+  const linhas = text.split('\n')
+  let i = linhas.length - 1
+  while (i >= 0 && !linhas[i].trim()) i--
+  if (i < 0) return { corpo: text }
+  const ultima = linhas[i].trim()
+  if (!ultima.endsWith('?')) return { corpo: text }
+  // The question can be a line of its own or the tail of the last paragraph
+  // ("...sai R$ 84,00. Fecho assim ou quer ajustar algo?").
+  const corte = Math.max(ultima.lastIndexOf('. '), ultima.lastIndexOf('! '), ultima.lastIndexOf('* '))
+  const pergunta = (corte >= 0 ? ultima.slice(corte + 2) : ultima).trim()
+  const antes = corte >= 0 ? ultima.slice(0, corte + 1).trim() : ''
+  if (pergunta.length > 120 || !PERGUNTA_DE_FECHAMENTO.test(pergunta)) return { corpo: text }
+  const corpo = [...linhas.slice(0, i), antes].join('\n').trim()
+  // A quote that is nothing but the question keeps it, or no quote would go out.
+  if (!corpo) return { corpo: text }
+  return { corpo, pergunta: pergunta.replace(/\*/g, '') }
+}
+
+// "[40x60cm] [60x90cm] [70x100cm]" — options written as bracketed text, the
+// model imitating buttons. On 04/10 the banner sizes went out like this and the
+// customer answered "Modo botão". pedeEscolhaEmTexto() misses it (no question
+// mark on that line), and asking the model to redo it costs a whole extra call,
+// so the brackets are turned into a real list right here.
+function opcoesEntreColchetes(text: string): { intro: string; pergunta?: string; opcoes: string[] } | null {
+  const linhas = text.split('\n').map((l) => l.trim())
+  const naoVazias = linhas.map((l, idx) => ({ l, idx })).filter((x) => x.l)
+  if (!naoVazias.length) return null
+  const ehColchetes = (l: string) => /^(\[[^\[\]]{1,24}\]\s*){2,10}$/.test(l)
+  const ult = naoVazias[naoVazias.length - 1]
+  const pen = naoVazias[naoVazias.length - 2]
+  let alvo = ult
+  let pergunta: string | undefined
+  if (!ehColchetes(ult.l)) {
+    // The brackets may be followed by the question itself ("Qual tamanho?").
+    if (!pen || !ehColchetes(pen.l) || !ult.l.endsWith('?') || ult.l.length > 100) return null
+    alvo = pen
+    pergunta = ult.l
+  }
+  const opcoes = [...alvo.l.matchAll(/\[([^\[\]]{1,24})\]/g)].map((m) => m[1].trim()).filter(Boolean)
+  if (opcoes.length < 2 || new Set(opcoes.map((o) => o.toLowerCase())).size !== opcoes.length) return null
+  return { intro: linhas.slice(0, alvo.idx).join('\n').trim(), pergunta, opcoes }
+}
+
+// A reply cut by the output limit ends mid-sentence: on 04/10 a quote went out
+// ending in "Ou" and the customer had to ask "Ou?" six minutes later. Drop the
+// dangling fragment so what goes out is at least whole.
+function semFraseCortada(text: string): string {
+  const linhas = text.split('\n')
+  while (linhas.length > 1) {
+    const ultima = linhas[linhas.length - 1].trim()
+    if (ultima && /[.!?…:*)\]\d]$/.test(ultima)) break
+    linhas.pop()
+  }
+  return linhas.join('\n').trim()
+}
+
 async function handleWithAI(
   chatId: string,
   wamid: string,
@@ -4033,6 +4096,19 @@ async function handleWithAI(
     let replyText = ''
     let cobrouBotoes = false
 
+    // Every reply used to go out quoting the customer's message — intro and
+    // options both, so one short answer showed the same quote twice. A quote
+    // only helps when the customer wrote again while this one was being
+    // answered, and then once is enough.
+    let jaCitou = false
+    const citar = (): string | undefined => {
+      if (jaCitou) return undefined
+      const chegouOutra = log.some((e) => e.chatId === chatId && e.direction === 'in' && (e.seq ?? 0) > seq)
+      if (!chegouOutra) return undefined
+      jaCitou = true
+      return wamid
+    }
+
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
       const response = await anthropic.messages.create({
         model: AI_MODEL,
@@ -4042,13 +4118,29 @@ async function handleWithAI(
         messages: withCacheBreakpoint(messages),
       })
       registrarUso(chatId, round, response.usage)
+      const cortada = response.stop_reason === 'max_tokens'
+      if (cortada) console.error(`ai: resposta cortada no limite de tokens de saída (chatId=${chatId}, rodada=${round + 1})`)
 
       const toolUses = response.content.filter(
         (b): b is Anthropic.Messages.ToolUseBlock => b.type === 'tool_use',
       )
 
       if (toolUses.length === 0) {
-        replyText = textOf(response.content)
+        replyText = cortada ? semFraseCortada(textOf(response.content)) : textOf(response.content)
+        const colchetes = opcoesEntreColchetes(replyText)
+        if (colchetes) {
+          console.log(`ai: opções entre colchetes viraram lista sem nova chamada (chatId=${chatId})`)
+          if (colchetes.intro) {
+            const sent = await sendText(chatId, colchetes.intro, citar())
+            if (!sent.ok) console.error('ai: send failed:', sent.data)
+          }
+          await sendAiOptions(
+            chatId,
+            { pergunta: colchetes.pergunta ?? 'Qual você prefere?', opcoes: colchetes.opcoes.map((t) => ({ titulo: t, valor: t })) },
+            citar(),
+          )
+          return
+        }
         if (!cobrouBotoes && round < MAX_TOOL_ROUNDS - 1 && pedeEscolhaEmTexto(replyText)) {
           cobrouBotoes = true
           console.log(`ai: escolha em texto — pedindo botões (chatId=${chatId})`)
@@ -4071,10 +4163,10 @@ async function handleWithAI(
         // first, then the options.
         const intro = textOf(response.content)
         if (intro) {
-          const sent = await sendText(chatId, intro, wamid)
+          const sent = await sendText(chatId, intro, citar())
           if (!sent.ok) console.error('ai: send failed:', sent.data)
         }
-        await sendAiOptions(chatId, showOptions.input, wamid)
+        await sendAiOptions(chatId, showOptions.input, citar())
         return
       }
 
@@ -4104,12 +4196,12 @@ async function handleWithAI(
         } else {
           console.error(`ai: oferecer_fechamento sem valor_total válido (chatId=${chatId}): ${JSON.stringify(oi.valor_total)}`)
         }
-        const text = textOf(response.content)
-        if (text) {
-          const sent = await sendText(chatId, text, wamid)
+        const { corpo, pergunta } = separarFechamento(textOf(response.content))
+        if (corpo) {
+          const sent = await sendText(chatId, corpo, citar())
           if (!sent.ok) console.error('ai: send failed:', sent.data)
         }
-        const buttons = await offersOrderButtons(chatId)
+        const buttons = await offersOrderButtons(chatId, pergunta)
         // The quote itself already went out above, so this is not silence — but
         // without the buttons the customer has no obvious way to say yes.
         if (!buttons.ok) {
@@ -4117,6 +4209,15 @@ async function handleWithAI(
           await sendText(chatId, 'Quer que eu siga com esse pedido? É só me confirmar. 🙂')
         }
         return
+      }
+
+      // Text written next to a lookup never reaches the customer — it is the
+      // model thinking aloud, billed as output. On 04/10 single rounds ran to
+      // 1,200-2,000 output tokens for a two-line answer. Logged so the effect of
+      // the "ferramenta primeiro, sem narrar" rule in instrucoes.md is visible.
+      const narrado = textOf(response.content)
+      if (narrado) {
+        console.log(`ai: ${narrado.length} caracteres escritos junto de ferramenta, não enviados (chatId=${chatId}, rodada=${round + 1})`)
       }
 
       messages.push({ role: 'assistant', content: response.content })
@@ -4148,7 +4249,7 @@ async function handleWithAI(
 
     // No automatic close buttons here: the model asks for them with
     // `oferecer_fechamento` when the conversation is actually at that point.
-    const result = await sendText(chatId, replyText, wamid)
+    const result = await sendText(chatId, replyText, citar())
     if (!result.ok) console.error('ai: send failed:', result.data)
   } catch (err) {
     console.error('ai: handling failed:', err)
