@@ -2036,17 +2036,114 @@ function materialList(): string {
   return sheetMaterials().map((m) => (m.extra ? `${m.name} (+${brl(m.extra)})` : m.name)).join('; ')
 }
 
-function quoteSheetStickers(larguraCm: number, alturaCm: number, quantidade: number, material?: string): string {
-  const tiers = sheetTiers()
-  const materiais = sheetMaterials()
-  if (!sheetEntry() || tiers.length === 0) {
-    // Names the actual cause, so the Railway log says which half failed instead
-    // of only that something did.
-    console.error(
-      `calcular_folha_adesivo: sem tabela de preço — produto=${sheetEntry()?.heading ?? 'NÃO ENCONTRADO'}, origem=${sheetTiersSource}`,
-    )
-    return 'Não consegui ler a tabela desse produto no catálogo. Não estime o valor — diga que a equipe confirma o preço.'
+// --- Sheet stickers sold as their own product ---
+//
+// "Adesivo Transparente com Tinta Branca" and "Adesivo Transparente com
+// Hotstamping" are sold by the 30x45cm sheet too, but each has its OWN price
+// table — they are separate products, not a material of the common sheet. On
+// 04/10 the assistant read their "100-499un" band as stickers and quoted
+// R$ 1.250,00 for 100 stickers (2 sheets). The first fix was a rule in
+// instrucoes.md telling the model to take the fit from this calculator and
+// ignore its total; the calculator kept answering "use exactly these numbers"
+// for the common product, and the model went back and forth between the two
+// until the round limit, on every message of that conversation. So the
+// arithmetic for these two lives here as well, and there is nothing to ignore.
+interface SheetVariant {
+  chave: 'tinta-branca' | 'hotstamping'
+  nome: string
+  titulo: (t: string) => boolean
+}
+const SHEET_VARIANTS: SheetVariant[] = [
+  {
+    chave: 'tinta-branca',
+    nome: 'Adesivo Transparente com Tinta Branca',
+    titulo: (t) => t.includes('adesivo') && t.includes('transparente') && t.includes('tinta branca'),
+  },
+  {
+    chave: 'hotstamping',
+    nome: 'Adesivo Transparente com Hotstamping',
+    titulo: (t) => t.includes('adesivo') && t.includes('transparente') && /hot ?stamping/.test(t),
+  },
+]
+
+// Which of them the model means, whether it said so in `produto` or — as it
+// tends to — in `material`. Metalizado + tinta branca is NOT one of them.
+function sheetVariantFor(produto?: string, material?: string): SheetVariant | undefined {
+  const t = normalize(`${produto ?? ''} ${material ?? ''}`)
+  if (/hot ?stamping/.test(t)) return SHEET_VARIANTS[1]
+  if (t.includes('tinta branca') && !/metaliz|prata|dourad|ouro/.test(t)) return SHEET_VARIANTS[0]
+  return undefined
+}
+
+function sheetVariantEntry(v: SheetVariant): CatalogEntry | undefined {
+  const alvo = normalize(v.nome)
+  const api = CATALOG_ENTRIES.filter((e) => e.api)
+  return (
+    api.find((e) => normalize(String(e.api!.titulo ?? '')).trim() === alvo) ??
+    api.find((e) => v.titulo(normalize(String(e.api!.titulo ?? ''))))
+  )
+}
+
+function quoteSheetVariant(v: SheetVariant, larguraCm: number, alturaCm: number, quantidade: number): string {
+  const semTabela = `Não consegui ler a tabela de "${v.nome}" no catálogo. Não estime o valor nem use a tabela de outro adesivo, e não chame esta ferramenta de novo — diga ao cliente que a equipe confirma o preço.`
+  const e = sheetVariantEntry(v)
+  if (!e?.api) {
+    console.error(`calcular_folha_adesivo: produto "${v.nome}" não encontrado no catálogo`)
+    return semTabela
   }
+  const conflito = apiConflictWarning(e.api)
+  if (conflito) return `Produto: ${v.nome}\n${conflito}`
+  const tiers = priceTiers(e.api).filter((t) => t.perUnit)
+  if (tiers.length === 0) {
+    console.error(`calcular_folha_adesivo: "${v.nome}" sem faixas por folha na API`)
+    return semTabela
+  }
+
+  const perSheet = Math.max(
+    Math.floor(SHEET_W_CM / larguraCm) * Math.floor(SHEET_H_CM / alturaCm),
+    Math.floor(SHEET_W_CM / alturaCm) * Math.floor(SHEET_H_CM / larguraCm),
+  )
+  if (perSheet < 1) {
+    return `Um adesivo de ${larguraCm}x${alturaCm}cm NÃO cabe na folha de ${SHEET_W_CM}x${SHEET_H_CM}cm de "${v.nome}". Não estime — diga que a equipe confirma se dá pra produzir nesse tamanho.`
+  }
+  const folhas = Math.ceil(quantidade / perSheet)
+  const first = tiers[0]
+  const last = tiers[tiers.length - 1]
+  const tier = tiers.find((t) => folhas >= t.min && folhas <= t.max) ?? (folhas < first.min ? first : undefined)
+  if (!tier) {
+    return `Esse pedido daria ${folhas} folhas de "${v.nome}", fora das faixas de preço do catálogo (vão até ${last.max === Number.MAX_SAFE_INTEGER ? last.min : last.max} folhas). Não estime nem faça regra de três — diga que a equipe confirma o preço dessa quantidade.`
+  }
+
+  // Options that add to the sheet price (laminação). Totals come ready, so the
+  // model never has to add anything by hand.
+  const opcionais = asArray<ApiVariation>(e.api.variacoes)
+    .filter((o) => o?.nome && Number.isFinite(toNumber(o.valor)) && toNumber(o.valor) > 0)
+    .map((o) => `${o.nome} ${brl((tier.price + toNumber(o.valor)) * folhas)}`)
+  const ate = tier.max === Number.MAX_SAFE_INTEGER ? `${tier.min}+` : `${tier.min}-${tier.max}`
+
+  return [
+    'CÁLCULO OFICIAL DO SISTEMA — use exatamente estes números, não recalcule:',
+    `- Produto: ${v.nome} (produto próprio, vendido por folha de ${SHEET_W_CM}x${SHEET_H_CM}cm)`,
+    `- Cabem ${perSheet} adesivos de ${larguraCm}x${alturaCm}cm na folha de ${SHEET_W_CM}x${SHEET_H_CM}cm`,
+    `- ${quantidade} adesivos ÷ ${perSheet} por folha = ${folhas} folha(s), arredondando pra cima`,
+    `- Faixa para ${folhas} folha(s): ${ate} folhas a ${brl(tier.price)}/folha`,
+    `- TOTAL: ${brl(tier.price * folhas)}`,
+    opcionais.length ? `- Se o cliente pedir um opcional, o total passa a ser: ${opcionais.join('; ')}` : '',
+    folhas >= 10 || quantidade >= 1000
+      ? '- Pedido grande: avise numa frase que a equipe confirma esse valor antes de fechar.'
+      : '- Pode fechar esse valor normalmente.',
+  ]
+    .filter(Boolean)
+    .join('\n')
+}
+
+function quoteSheetStickers(
+  larguraCm: number,
+  alturaCm: number,
+  quantidade: number,
+  material?: string,
+  produto?: string,
+): string {
   // Number.isFinite rejects NaN and Infinity as well as 0 and negatives. Without
   // the finite check, an absurd value came back to the customer echoed verbatim
   // ("Um adesivo de Infinityx5cm..."). The upper bounds are sanity limits: a
@@ -2057,6 +2154,21 @@ function quoteSheetStickers(larguraCm: number, alturaCm: number, quantidade: num
     return 'Medidas ou quantidade inválidas. Peça ao cliente a largura e a altura em cm e a quantidade de adesivos.'
   }
 
+  // The two sheet products with a table of their own never touch the common
+  // product's table, so they are settled before it is even looked up.
+  const variante = sheetVariantFor(produto, material)
+  if (variante) return quoteSheetVariant(variante, larguraCm, alturaCm, quantidade)
+
+  const tiers = sheetTiers()
+  const materiais = sheetMaterials()
+  if (!sheetEntry() || tiers.length === 0) {
+    // Names the actual cause, so the Railway log says which half failed instead
+    // of only that something did.
+    console.error(
+      `calcular_folha_adesivo: sem tabela de preço — produto=${sheetEntry()?.heading ?? 'NÃO ENCONTRADO'}, origem=${sheetTiersSource}`,
+    )
+    return 'Não consegui ler a tabela desse produto no catálogo. Não estime o valor — diga que a equipe confirma o preço.'
+  }
   // Try the art both ways round on the sheet and keep whichever fits more.
   const perSheet = Math.max(
     Math.floor(SHEET_W_CM / larguraCm) * Math.floor(SHEET_H_CM / alturaCm),
@@ -2360,7 +2472,7 @@ const AI_TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: 'calcular_folha_adesivo',
     description:
-      'Calcula o preço exato de adesivos cortados em folha ("Folha Adesivo Personalizado"): quantos cabem na folha de 30x45cm, quantas folhas o pedido precisa, a faixa de preço correta pra esse número de folhas, e o total. Use SEMPRE que o cliente pedir adesivo personalizado por quantidade e tamanho (ex: "100 adesivos 6x6cm") — nunca faça essa conta de cabeça nem reaproveite um preço de outra mensagem da conversa. Os números que essa ferramenta devolve são os oficiais: repita eles como vieram.',
+      'Calcula o preço exato de adesivos cortados em folha ("Folha Adesivo Personalizado", e também os produtos próprios "Adesivo Transparente com Tinta Branca" e "Adesivo Transparente com Hotstamping", via o campo produto): quantos cabem na folha de 30x45cm, quantas folhas o pedido precisa, a faixa de preço correta pra esse número de folhas, e o total. Use SEMPRE que o cliente pedir adesivo personalizado por quantidade e tamanho (ex: "100 adesivos 6x6cm") — nunca faça essa conta de cabeça nem reaproveite um preço de outra mensagem da conversa. Os números que essa ferramenta devolve são os oficiais: repita eles como vieram.',
     input_schema: {
       type: 'object',
       properties: {
@@ -2382,6 +2494,11 @@ const AI_TOOLS: Anthropic.Messages.Tool[] = [
         material: {
           type: 'string',
           description: 'Material escolhido pelo cliente, ex: "Vinil Adesivo Brilho". Deixe vazio se ele ainda não escolheu.',
+        },
+        produto: {
+          type: 'string',
+          description:
+            'Deixe vazio para o adesivo comum em folha. Preencha "tinta branca" para o Adesivo Transparente com Tinta Branca e "hotstamping" para o Adesivo Transparente com Hotstamping: esses dois são produtos próprios, com tabela própria por folha, e a ferramenta já devolve o total certo deles.',
         },
       },
       required: ['largura_cm', 'altura_cm', 'quantidade'],
@@ -3929,6 +4046,7 @@ function runAiTool(tu: Anthropic.Messages.ToolUseBlock, chatId: string): string 
         Number(input.altura_cm),
         Number(input.quantidade),
         typeof input.material === 'string' && input.material.trim() ? input.material : undefined,
+        typeof input.produto === 'string' && input.produto.trim() ? input.produto : undefined,
       )
     }
     if (tu.name === 'calcular_cartela_tatuagem') {
@@ -3991,6 +4109,11 @@ function pedeEscolhaEmTexto(text: string): boolean {
   if (/\bqua(l|is) (voc[êe] )?prefere\b|\bqual dess[ae]s?\b|\bqual del[ae]s\b/i.test(ultima) && PALAVRA_DE_ESCOLHA.test(text)) return true
   return /\b(quantas unidades|qual (tamanho|cor|papel|material|acabamento|linha|modelo|quantidade|impress[ãa]o))\b/i.test(ultima)
 }
+
+const CONSULTA_REPETIDA =
+  '[Aviso do sistema] Você já fez exatamente esta consulta nesta resposta, e o resultado é o mesmo que já recebeu — ele não muda. ' +
+  'Não consulte de novo: responda ao cliente agora com o que já tem. Se dois números não fecham entre si, não escolha um: ' +
+  'diga que a equipe confirma o valor antes de fechar.'
 
 const COBRAR_BOTOES =
   '[Aviso do sistema — não é o cliente] Sua resposta termina pedindo que o cliente escolha, mas foi escrita em texto. ' +
@@ -4109,12 +4232,23 @@ async function handleWithAI(
       return wamid
     }
 
+    // Two guards against the model going round in circles. On 04/10 a rule in
+    // the instructions and a calculator result contradicted each other and the
+    // model alternated between the same two calls until the round limit — the
+    // customer got "me embolei" on every message, a plain "Oi" included, because
+    // the unanswered request was still in the history. (1) An identical call in
+    // the same turn is answered with "you already have this", not run again.
+    // (2) The last round cannot call tools at all, so it always ends in text.
+    const jaConsultou = new Set<string>()
+
     for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+      const ultima = round === MAX_TOOL_ROUNDS - 1
       const response = await anthropic.messages.create({
         model: AI_MODEL,
         max_tokens: 2048,
         system,
         tools: AI_TOOLS,
+        ...(ultima ? { tool_choice: { type: 'none' as const } } : {}),
         messages: withCacheBreakpoint(messages),
       })
       registrarUso(chatId, round, response.usage)
@@ -4223,12 +4357,29 @@ async function handleWithAI(
       messages.push({ role: 'assistant', content: response.content })
       messages.push({
         role: 'user',
-        content: toolUses.map((tu) => ({
-          type: 'tool_result' as const,
-          tool_use_id: tu.id,
-          content: runAiTool(tu, chatId),
-        })),
+        content: toolUses.map((tu) => {
+          const chave = `${tu.name}:${JSON.stringify(tu.input ?? {})}`
+          // Saving a note twice is harmless; everything else is a lookup whose
+          // answer cannot change inside one turn.
+          if (jaConsultou.has(chave) && tu.name !== 'salvar_nota_cliente') {
+            console.error(`ai: chamada repetida de ${tu.name} na mesma resposta (chatId=${chatId}, rodada=${round + 1})`)
+            return {
+              type: 'tool_result' as const,
+              tool_use_id: tu.id,
+              content: CONSULTA_REPETIDA,
+            }
+          }
+          jaConsultou.add(chave)
+          return {
+            type: 'tool_result' as const,
+            tool_use_id: tu.id,
+            content: runAiTool(tu, chatId),
+          }
+        }),
       })
+      if (round === MAX_TOOL_ROUNDS - 2) {
+        console.error(`ai: ${MAX_TOOL_ROUNDS - 1} rodadas de ferramenta sem resposta — a próxima sai só em texto (chatId=${chatId})`)
+      }
     }
 
     // Running out of tool rounds used to end in silence — the loop finished
@@ -5250,6 +5401,11 @@ app.get('/folha-check', (c) => {
     origemDasFaixas: sheetTiersSource,
     materiais: materiais.map((m) => ({ nome: m.name, acrescimo: brl(m.extra) })),
     exemplo100Adesivos5x5: exemplo,
+    // The two sheet products with a table of their own, and the same request
+    // made through the material field (must give the same answer).
+    exemploTintaBranca100Adesivos5x5: quoteSheetStickers(5, 5, 100, undefined, 'tinta branca'),
+    exemploHotstamping100Adesivos5x5: quoteSheetStickers(5, 5, 100, undefined, 'hotstamping'),
+    exemploTintaBrancaPeloMaterial: quoteSheetStickers(5, 5, 100, 'Vinil Adesivo Transparente Brilho + Tinta Branca'),
   })
 })
 
