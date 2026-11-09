@@ -2185,9 +2185,9 @@ function quoteSheetVariant(v: SheetVariant, larguraCm: number, alturaCm: number,
     `- Faixa para ${folhas} folha(s): ${ate} folhas a ${brl(tier.price)}/folha`,
     `- TOTAL: ${brl(tier.price * folhas)}`,
     opcionais.length ? `- Se o cliente pedir um opcional, o total passa a ser: ${opcionais.join('; ')}` : '',
-    folhas >= 10 || quantidade >= 1000
-      ? '- Pedido grande: avise numa frase que a equipe confirma esse valor antes de fechar.'
-      : '- Pode fechar esse valor normalmente.',
+    // Inside the table there is no "big order" to confirm (09/11: only a
+    // quantity above the last price tier goes to the team, handled above).
+    '- Pode fechar esse valor normalmente.',
   ]
     .filter(Boolean)
     .join('\n')
@@ -2269,9 +2269,9 @@ function quoteSheetStickers(
     `- Faixa para ${folhas} folha(s): ${tier.min}-${tier.max} folhas a ${brl(tier.price)}/folha` +
       (extra ? ` + ${brl(extra)} de ${materialName} = ${brl(unit)}/folha` : ''),
     `- TOTAL: ${brl(unit * folhas)}`,
-    folhas >= 10 || quantidade >= 1000
-      ? '- Pedido grande: avise numa frase que a equipe confirma esse valor antes de fechar.'
-      : '- Pode fechar esse valor normalmente.',
+    // Inside the table there is no "big order" to confirm (09/11: only a
+    // quantity above the last price tier goes to the team, handled above).
+    '- Pode fechar esse valor normalmente.',
     material ? '' : `- O cliente ainda não escolheu material; este total usa "${materialName}". Materiais reais: ${materialList()}`,
   ]
     .filter(Boolean)
@@ -2458,9 +2458,9 @@ function quoteTattooCartela(
     `- Faixa para ${cartelas} cartela(s): ${tier.min}-${tier.max === Number.MAX_SAFE_INTEGER ? `${tier.min}+` : tier.max} cartelas a ${brl(tier.price)}/cartela` +
       (tamanho.extra ? ` + ${brl(tamanho.extra)} do tamanho maior = ${brl(unit)}/cartela` : ''),
     `- TOTAL: ${brl(unit * cartelas)}`,
-    cartelas >= 10 || quantidade >= 500
-      ? '- Pedido grande: avise numa frase que a equipe confirma esse valor antes de fechar.'
-      : '- Pode fechar esse valor normalmente.',
+    // Inside the table there is no "big order" to confirm (09/11: only a
+    // quantity above the last price tier goes to the team, handled above).
+    '- Pode fechar esse valor normalmente.',
     `- Tamanhos de cartela disponíveis: ${tamanhos.map((t) => `${t.wCm}x${t.hCm}cm${t.extra ? ` (+${brl(t.extra)})` : ''}`).join('; ')}`,
   ]
     .filter(Boolean)
@@ -2665,7 +2665,7 @@ const AI_TOOLS: Anthropic.Messages.Tool[] = [
   {
     name: 'chamar_equipe',
     description:
-      'Avisa a equipe da Quick Gráfica, no WhatsApp interno, que este cliente precisa de uma pessoa. Use quando: ele pedir pra falar com atendente/pessoa ou com um setor (financeiro, arte/criação, produção, entrega, comercial); ou quando você disser que a equipe vai confirmar algo (valor de pedido grande, boleto, frete, prazo urgente, arte) — sem esta ferramenta ninguém fica sabendo. Depois de chamar, diga numa frase que já avisou (citando o setor, se ele pediu) e que respondem por aqui mesmo. Uma vez por assunto.',
+      'Avisa a equipe da Quick Gráfica, no WhatsApp interno, que este cliente precisa de uma pessoa. Use quando: ele pedir pra falar com atendente/pessoa ou com um setor (financeiro, arte/criação, produção, entrega, comercial); ou quando você disser que a equipe vai confirmar algo (quantidade acima da tabela, boleto, frete, prazo urgente, arte) — sem esta ferramenta ninguém fica sabendo. NÃO é pra pedido com preço na tabela: isso você mesma cota e fecha. Depois de chamar, diga numa frase que já avisou (citando o setor, se ele pediu) e que respondem por aqui mesmo — e, se a busca trouxe preço, a mesma mensagem traz o valor da tabela ("Pela tabela fica R$ X; a equipe confirma o final"). Nunca responda só "já avisei a equipe" quando você tem um preço. Uma vez por assunto.',
     input_schema: {
       type: 'object',
       properties: {
