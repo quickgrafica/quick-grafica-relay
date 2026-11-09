@@ -234,14 +234,13 @@ async function sendCapiEvent(
 // going back (AI_MODEL=claude-sonnet-5) or trying another model needs no upload.
 const AI_MODEL = env('AI_MODEL') || 'claude-sonnet-5-5'
 console.log(`ai: modelo ${AI_MODEL}`)
-// Sonnet 5.5 thinks before every answer by default, even "low": in the 09/11
-// test output doubled against Sonnet 5 (≈290 vs ≈140 tokens per call), almost
-// all of it thinking the customer never sees. "between_tools" drops the
-// up-front thinking and keeps it after a tool result, which is where the
-// price maths happens. AI_THINKING=padrao in Railway goes back to the default.
-// If the API ever refuses it, the first refusal turns it off (see criarResposta).
-let AI_THINKING: string | undefined =
-  env('AI_THINKING') === 'padrao' ? undefined : env('AI_THINKING') || (AI_MODEL.startsWith('claude-sonnet-5-5') ? 'between_tools' : undefined)
+// Thinking mode, off by default (the model's own default applies). On 09/11
+// "between_tools" (no up-front thinking) cut output tokens but the replies got
+// worse within the hour: long lists of every version with prices, no questions
+// before the price, two questions per message. Kept as an option only:
+// AI_THINKING=between_tools in Railway turns it back on. If the API ever
+// refuses a mode, the first refusal turns it off (see criarResposta).
+let AI_THINKING: string | undefined = env('AI_THINKING') && env('AI_THINKING') !== 'padrao' ? env('AI_THINKING') : undefined
 if (AI_THINKING) console.log(`ai: thinking ${AI_THINKING}`)
 const AI_EFFORT = (['low', 'medium', 'high'].includes(env('AI_EFFORT')) ? env('AI_EFFORT') : 'low') as 'low' | 'medium' | 'high'
 // The webhook handler awaits the whole reply before responding (see the comment
