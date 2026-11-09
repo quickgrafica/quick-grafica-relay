@@ -1034,18 +1034,32 @@ function m2Products(): Array<{ e: CatalogEntry; p: ApiProduct; cfg: M2Config }> 
 function calcularMetroQuadrado(produto: string, larguraCm: number, alturaCm: number, quantidade: number): string {
   const lista = m2Products()
   if (!lista.length) return 'Nenhum produto por m² disponível no catálogo agora. Não estime: diga que a equipe confirma o valor.'
+  // The title decides, not the extras. Plain word counting over title +
+  // formato + material picked the wrong product on 09/11: "Backdrop Lona Fosca
+  // 380g" (fosca is a choice inside the plain "Backdrop / Lona") matched
+  // "backdrop", "lona" AND "380g" on "Backdrop / Lona Backlight", whose
+  // material is "Lona Back Light 380g" — so the plain lona lost, the model got
+  // a Backlight quote, called again with the same name, and the customer got
+  // "a equipe confirma" for a product with a price. Now a title word the
+  // customer did not say ("backlight", "perfurada") counts against.
   const words = normalize(produto).split(/[^a-z0-9]+/).filter((w) => w.length > 1)
+  const pedido = new Set(words)
   const scored = lista
     .map((x) => {
-      const hay = normalize(`${x.p.titulo} ${x.p.formato ?? ''} ${x.p.material ?? ''}`)
-      const score = words.reduce((s, w) => s + (hay.includes(w) ? 1 : 0), 0)
-      return { ...x, score }
+      const tituloWords = normalize(x.p.titulo).split(/[^a-z0-9]+/).filter((w) => w.length > 1)
+      const resto = normalize(`${x.p.formato ?? ''} ${x.p.material ?? ''}`)
+      const noTitulo = words.filter((w) => tituloWords.includes(w)).length
+      const noResto = words.filter((w) => !tituloWords.includes(w) && resto.includes(w)).length
+      const sobra = tituloWords.filter((w) => !pedido.has(w)).length
+      const score = noTitulo * 2 + noResto - sobra * 2
+      return { ...x, score, noTitulo }
     })
-    .filter((x) => x.score > 0)
-    .sort((a, b) => b.score - a.score)
+    .filter((x) => x.noTitulo > 0)
+    // Tie on score: more of the customer's words in the title wins.
+    .sort((a, b) => b.score - a.score || b.noTitulo - a.noTitulo)
   const nomes = lista.map((x) => `"${x.p.titulo}${x.p.formato ? ` ${x.p.formato}` : ''}"`).join(', ')
   if (!scored.length) return `Não achei "${produto}" entre os produtos por m². Os disponíveis são: ${nomes}. Chame de novo com um desses nomes.`
-  const top = scored.filter((x) => x.score === scored[0].score)
+  const top = scored.filter((x) => x.score === scored[0].score && x.noTitulo === scored[0].noTitulo)
   if (top.length > 1) {
     const opts = top.map((x) => `"${x.p.titulo}${x.p.formato ? ` ${x.p.formato}` : ''}" (${brl(x.cfg.precoMetro)}/m²)`).join(', ')
     return `"${produto}" bate com mais de um produto: ${opts}. Chame de novo com o nome exato do que o cliente quer (se não souber qual, pergunte a ele).`
@@ -2620,7 +2634,7 @@ const AI_TOOLS: Anthropic.Messages.Tool[] = [
       properties: {
         produto: {
           type: 'string',
-          description: 'Nome do produto como apareceu na busca, ex: "Banner Personalizado", "Backdrop / Lona", "Tecido Impresso Personalizado".',
+          description: 'Título da ficha exatamente como apareceu na busca, ex: "Banner Personalizado", "Backdrop / Lona", "Tecido Impresso Personalizado". Sem a opção que o cliente escolheu (fosca, brilho, ilhós): essas não fazem parte do nome.',
         },
         largura_cm: { type: 'number', description: 'Largura em cm, da mensagem mais recente do cliente (converta metros: 1,5m = 150).' },
         altura_cm: { type: 'number', description: 'Altura em cm, da mensagem mais recente do cliente.' },
