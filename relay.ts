@@ -318,6 +318,10 @@ function surchargeLabel(v: ApiVariation): string {
   if (!Number.isFinite(valor) || valor === 0) return ''
   const money = brl(valor)
   if (v.cobranca === 0 || v.cobranca === undefined) return ` (+${money}/un)`
+  // 1 = per m², as the site's own price script reads it (custoVariacoes in
+  // Imprimastore's carrinho.js: 0 unidade, 1 metro, 2 fixo, 3 a cada qtde).
+  // Ilhós on the Backdrop is +R$ 5,00/m²; calcular_metro_quadrado adds it.
+  if (v.cobranca === 1) return ` (+${money}/m²)`
   if (v.cobranca === 2) return ` (+${money} FIXO)`
   return ` (+${money} A CONFIRMAR)`
 }
@@ -738,6 +742,11 @@ interface M2Config {
   larguraMaxCm: number
   alturaMaxCm: number
   descontos: M2Discount[]
+  // "individual": 1 = minimum charge and discount step per piece (Backdrop),
+  // 0 = per order. "tipo": 1 = priced by linear metre (height only).
+  // Both read the way the site's carrinho.js reads them; absent = 1 and 0.
+  individual: boolean
+  linear: boolean
 }
 
 function m2Config(p: ApiProduct): M2Config | null {
@@ -764,22 +773,52 @@ function m2Config(p: ApiProduct): M2Config | null {
       larguraMaxCm: Number.isFinite(larguraMax) && larguraMax > 0 ? larguraMax : 0,
       alturaMaxCm: Number.isFinite(alturaMax) && alturaMax > 0 ? alturaMax : 0,
       descontos,
+      individual: t.individual == null || String(t.individual) !== '0',
+      linear: String(t.tipo ?? '0') === '1',
     }
   }
   return null
 }
 
+// desconto_tipo as the site applies it (descontoMt in carrinho.js): 1 = that
+// many reais off each m², anything else = a percentage off the m² price. The
+// relay read 1 as a percentage until 09/11 — Backdrop from 10 m² is R$ 4,00
+// off the m² (R$ 64 → R$ 60), not 4%.
 function m2DiscountLabel(d: M2Discount): string {
-  const pct = `${String(d.valor).replace('.', ',')}%`
-  return d.tipo === 1 ? `a partir de ${d.apartir} m²: ${pct}` : `a partir de ${d.apartir} m²: a equipe confirma`
+  const v = String(d.valor).replace('.', ',')
+  return d.tipo === 1 ? `a partir de ${d.apartir} m²: R$ ${v} a menos por m²` : `a partir de ${d.apartir} m²: ${v}% no m²`
+}
+
+// The m² price after the discount step reached by `area` (last step wins).
+function m2Descontado(cfg: M2Config, valMetro: number, area: number): { valor: number; faixa?: M2Discount } {
+  let faixa: M2Discount | undefined
+  for (const d of cfg.descontos) if (area >= d.apartir) faixa = d
+  if (!faixa) return { valor: valMetro }
+  const desconto = faixa.tipo === 1 ? faixa.valor : valMetro * (faixa.valor / 100)
+  const valor = valMetro - desconto
+  return valor > 0 ? { valor, faixa } : { valor: valMetro }
+}
+
+// Surcharges of the options the customer picked, split by how each is charged.
+interface M2Extras {
+  metro: number
+  unidade: number
+  fixo: number
+  linhas: string[]
+  aConfirmar: string[]
 }
 
 // One area quote, computed here rather than by the model: the arithmetic
-// (cm → m², minimum charge, width limit) is exactly what an LLM gets wrong.
-function quoteM2(cfg: M2Config, larguraCm: number, alturaCm: number, quantidade: number): {
-  ok: boolean
-  texto: string
-} {
+// (cm → m², minimum charge, width limit, options, discount) is exactly what an
+// LLM gets wrong. Follows the site's own calculation (Imprimastore carrinho.js)
+// step by step, so the quote matches what the customer sees at checkout.
+function quoteM2(
+  cfg: M2Config,
+  larguraCm: number,
+  alturaCm: number,
+  quantidade: number,
+  extras: M2Extras = { metro: 0, unidade: 0, fixo: 0, linhas: [], aConfirmar: [] },
+): { ok: boolean; texto: string } {
   if (![larguraCm, alturaCm, quantidade].every((n) => Number.isFinite(n) && n > 0)) {
     return { ok: false, texto: 'Medidas ou quantidade inválidas — confirme largura, altura (em cm) e quantidade com o cliente.' }
   }
@@ -790,39 +829,90 @@ function quoteM2(cfg: M2Config, larguraCm: number, alturaCm: number, quantidade:
       texto: `Esse produto tem largura máxima de ${cfg.larguraMaxCm}cm e as duas medidas pedidas (${larguraCm}x${alturaCm}cm) passam disso. Não cote: explique o limite e ofereça dividir em partes ou encaminhar pra equipe.`,
     }
   }
-  const area = (larguraCm * alturaCm) / 10000
-  const porArea = area * cfg.precoMetro
-  const unit = Math.round(Math.max(porArea, cfg.precoMin) * 100) / 100
-  const total = Math.round(unit * quantidade * 100) / 100
+  const L = larguraCm / 100
+  const A = alturaCm / 100
+  const area = L * A
   const fmtM2 = (n: number) => n.toFixed(4).replace(/0+$/, '').replace(/\.$/, '').replace('.', ',')
-  const linhas = [
-    `Medida: ${larguraCm}x${alturaCm}cm = ${fmtM2(area)} m² por peça`,
-    `Preço por m²: ${brl(cfg.precoMetro)}${cfg.precoMin ? ` (mínimo por peça: ${brl(cfg.precoMin)})` : ''}`,
-    porArea < cfg.precoMin
-      ? `Valor por peça: ${brl(unit)} (a área daria ${brl(porArea)}, abaixo do mínimo — vale o mínimo)`
-      : `Valor por peça: ${brl(unit)}`,
-    `Quantidade: ${quantidade} → SUBTOTAL: ${brl(total)}`,
-  ]
-  // The discount steps count total m² in the order (the shop's rule: 5, 10,
-  // 20 m²...). Type 1 is a percentage and is applied here. Type 0 shows up at
-  // the top steps with numbers that don't match the percentage scale — its
-  // meaning isn't known, so those orders go to the team instead of guessing.
-  const areaTotal = area * quantidade
-  const faixa = [...cfg.descontos].reverse().find((d) => areaTotal >= d.apartir)
-  if (!faixa) {
-    linhas.push(`TOTAL: ${brl(total)}`)
-  } else if (faixa.tipo === 1) {
-    const desconto = Math.round(total * faixa.valor) / 100
-    linhas.push(
-      `Área total do pedido: ${fmtM2(areaTotal)} m² → desconto progressivo de ${String(faixa.valor).replace('.', ',')}% (a partir de ${faixa.apartir} m²): -${brl(desconto)}`,
-      `TOTAL COM DESCONTO: ${brl(Math.round((total - desconto) * 100) / 100)}`,
-    )
+  const r2 = (n: number) => Math.round(n * 100) / 100
+
+  const valMetroCheio = cfg.precoMetro + extras.metro
+  const areaDesconto = cfg.individual ? area : area * quantidade
+  const { valor: valMetro, faixa } = m2Descontado(cfg, valMetroCheio, areaDesconto)
+  const medida = cfg.linear ? A : area
+
+  let pecas: number
+  let porPeca: number | undefined
+  let usouMinimo = false
+  if (cfg.individual) {
+    const calc = medida * valMetro
+    usouMinimo = calc < cfg.precoMin
+    porPeca = Math.max(calc, cfg.precoMin)
+    pecas = porPeca * quantidade
   } else {
-    linhas.push(
-      `Área total do pedido: ${fmtM2(areaTotal)} m², faixa de desconto que a equipe precisa confirmar. Informe o subtotal acima como valor sem desconto e diga que a equipe confirma o desconto final — não calcule o desconto você mesma.`,
-    )
+    pecas = medida * quantidade * valMetro
+    usouMinimo = pecas < cfg.precoMin
+    if (usouMinimo) pecas = cfg.precoMin
   }
+  const total = r2(pecas + extras.unidade * quantidade + extras.fixo)
+
+  const linhas = [
+    cfg.linear ? `Medida: ${larguraCm}x${alturaCm}cm — cobrado por metro linear (${fmtM2(A)} m de altura)` : `Medida: ${larguraCm}x${alturaCm}cm = ${fmtM2(area)} m² por peça`,
+    `Preço por m²: ${brl(cfg.precoMetro)}${cfg.precoMin ? ` (mínimo ${cfg.individual ? 'por peça' : 'por pedido'}: ${brl(cfg.precoMin)})` : ''}`,
+    ...extras.linhas,
+  ]
+  if (faixa) linhas.push(`Desconto progressivo (${m2DiscountLabel(faixa)}): m² sai a ${brl(valMetro)}`)
+  if (porPeca !== undefined) {
+    linhas.push(usouMinimo ? `Valor por peça: ${brl(r2(porPeca))} (abaixo do mínimo — vale o mínimo)` : `Valor por peça: ${brl(r2(porPeca))}`)
+  } else if (usouMinimo) {
+    linhas.push(`O pedido ficou abaixo do mínimo — vale o mínimo de ${brl(cfg.precoMin)}`)
+  }
+  if (quantidade > 1) linhas.push(`Quantidade: ${quantidade}`)
+  linhas.push(`TOTAL: ${brl(total)}`)
+  if (extras.aConfirmar.length) {
+    linhas.push(`⚠️ Estas opções têm acréscimo que a equipe confirma (não some você): ${extras.aConfirmar.join('; ')}. Dê o TOTAL acima como valor sem elas.`)
+  }
+  linhas.push('Ao cliente, dê só o produto, a medida, as opções e o valor — não mostre a conta de m².')
   return { ok: true, texto: linhas.join('\n') }
+}
+
+// Finds the options the customer chose among the product's variations and
+// sums their surcharges by charge type. Names are matched loosely ("ilhos",
+// "Ilhós nas extremidades"); an option name the product doesn't have is said
+// so instead of silently priced at zero.
+function m2Opcoes(p: ApiProduct, escolhidas: string[]): M2Extras & { naoAchei: string[] } {
+  const out = { metro: 0, unidade: 0, fixo: 0, linhas: [] as string[], aConfirmar: [] as string[], naoAchei: [] as string[] }
+  const variacoes = asArray<ApiVariation>(p.variacoes).filter((v) => v?.nome)
+  for (const pedida of escolhidas) {
+    const alvo = normalize(pedida).replace(/[^a-z0-9]+/g, ' ').trim()
+    if (!alvo) continue
+    const palavras = alvo.split(' ').filter((w) => w.length > 2)
+    const v =
+      variacoes.find((x) => normalize(x.nome).replace(/[^a-z0-9]+/g, ' ').trim() === alvo) ??
+      variacoes.find((x) => {
+        const nome = normalize(x.nome).replace(/[^a-z0-9]+/g, ' ')
+        return palavras.length > 0 && palavras.every((w) => nome.includes(w))
+      })
+    if (!v) {
+      out.naoAchei.push(pedida)
+      continue
+    }
+    const valor = toNumber(v.valor)
+    if (!Number.isFinite(valor) || valor === 0) {
+      out.linhas.push(`Opção ${v.nome}: sem acréscimo`)
+    } else if (v.cobranca === 1) {
+      out.metro += valor
+      out.linhas.push(`Opção ${v.nome}: +${brl(valor)} por m²`)
+    } else if (v.cobranca === 0 || v.cobranca === undefined) {
+      out.unidade += valor
+      out.linhas.push(`Opção ${v.nome}: +${brl(valor)} por peça`)
+    } else if (v.cobranca === 2) {
+      out.fixo += valor
+      out.linhas.push(`Opção ${v.nome}: +${brl(valor)} uma vez no pedido`)
+    } else {
+      out.aConfirmar.push(`${v.nome} (+${brl(valor)})`)
+    }
+  }
+  return out
 }
 
 // --- Price comparison across a whole product family ---
@@ -1031,7 +1121,7 @@ function m2Products(): Array<{ e: CatalogEntry; p: ApiProduct; cfg: M2Config }> 
 // Picks the m² product the model named. Tolerant of wording ("banner
 // personalizado", "lona backdrop"), but never guesses between two equally
 // good matches — it lists them instead.
-function calcularMetroQuadrado(produto: string, larguraCm: number, alturaCm: number, quantidade: number): string {
+function calcularMetroQuadrado(produto: string, larguraCm: number, alturaCm: number, quantidade: number, opcoes: string[] = []): string {
   const lista = m2Products()
   if (!lista.length) return 'Nenhum produto por m² disponível no catálogo agora. Não estime: diga que a equipe confirma o valor.'
   // The title decides, not the extras. Plain word counting over title +
@@ -1067,8 +1157,17 @@ function calcularMetroQuadrado(produto: string, larguraCm: number, alturaCm: num
   const alvo = top[0]
   const conflito = apiConflictWarning(alvo.p)
   if (conflito) return `Produto: ${alvo.p.titulo}${alvo.p.formato ? ` (${alvo.p.formato})` : ''}\n${conflito}`
-  const q = quoteM2(alvo.cfg, larguraCm, alturaCm, quantidade)
-  return `Produto: ${alvo.p.titulo}${alvo.p.formato ? ` (${alvo.p.formato})` : ''}\n${q.texto}`
+  const extras = m2Opcoes(alvo.p, opcoes)
+  const q = quoteM2(alvo.cfg, larguraCm, alturaCm, quantidade, extras)
+  const opcoesFicha = asArray<ApiVariation>(alvo.p.variacoes).filter((v) => v?.nome).map((v) => v.nome)
+  const aviso = extras.naoAchei.length
+    ? `\n⚠️ Não achei nesta ficha a(s) opção(ões): ${extras.naoAchei.join('; ')}. As opções dela são: ${opcoesFicha.join('; ') || 'nenhuma'}. Se o cliente escolheu uma delas, chame de novo com o nome exato.`
+    : ''
+  const semOpcao =
+    !opcoes.length && opcoesFicha.length
+      ? `\nEsta ficha tem opções (${opcoesFicha.join('; ')}): se o cliente ainda não escolheu, pergunte antes de dar o valor final e chame de novo com \`opcoes\`.`
+      : ''
+  return `Produto: ${alvo.p.titulo}${alvo.p.formato ? ` (${alvo.p.formato})` : ''}\n${q.texto}${aviso}${semOpcao}`
 }
 
 // The quantity tiers, cleaned and ordered, whatever container they arrived in.
@@ -2639,6 +2738,11 @@ const AI_TOOLS: Anthropic.Messages.Tool[] = [
         largura_cm: { type: 'number', description: 'Largura em cm, da mensagem mais recente do cliente (converta metros: 1,5m = 150).' },
         altura_cm: { type: 'number', description: 'Altura em cm, da mensagem mais recente do cliente.' },
         quantidade: { type: 'number', description: 'Quantidade de peças. Use 1 se o cliente não falou.' },
+        opcoes: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'As opções que o cliente escolheu, com o nome como aparece nas ESCOLHAS da busca (ex: ["Lona Fosca 380g", "Ilhós nas extremidades"]). A ferramenta soma o acréscimo de cada uma (por m², por peça ou fixo).',
+        },
       },
       required: ['produto', 'largura_cm', 'altura_cm', 'quantidade'],
     },
@@ -4541,6 +4645,7 @@ function runAiTool(tu: Anthropic.Messages.ToolUseBlock, chatId: string, pushName
         Number(input.largura_cm),
         Number(input.altura_cm),
         Number(input.quantidade) || 1,
+        Array.isArray(input.opcoes) ? input.opcoes.filter((o: unknown): o is string => typeof o === 'string') : [],
       )
     }
     if (tu.name === 'salvar_nota_cliente') {
