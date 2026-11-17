@@ -1783,7 +1783,7 @@ const SEARCH_STOPWORDS = new Set(
 // rule that matches the customer's phrase adds its catalog terms to the query,
 // so intent finds the product with no word in common. Every term here was
 // checked against real headings in catalogo.md.
-const SEARCH_INTENTS: Array<{ when: RegExp; add: string }> = [
+const SEARCH_INTENTS: Array<{ when: RegExp; add: string; weight?: number }> = [
   { when: /camiset|camisa|blusa|roupa|uniforme|tecido|estampa|moletom|bone/, add: 'dtf textil' },
   { when: /carro|veiculo|moto|frota|van|caminhao|adesivar o carro|envelopamento/, add: 'vinil metro quadrado plotter recorte' },
   { when: /feira|stand|estande|exposicao|congresso|palestra|convencao/, add: 'roll up wind banner totem backdrop' },
@@ -1829,6 +1829,20 @@ const SEARCH_INTENTS: Array<{ when: RegExp; add: string }> = [
   { when: /postal|post card/, add: 'postais' },
   { when: /almofada/, add: 'capa de almofada' },
   { when: /mouse ?pad/, add: 'mouse pad' },
+  // Products the site sells under names customers rarely use (checked against
+  // the live product pages, 17/11/2026).
+  { when: /cobre.?placa|capa (de|da|pra) placa|placa d[ao] (carro|moto)/, add: 'cobre placa' },
+  { when: /pirulito|placa de mao|plaquinha|placa com cabo/, add: 'placa pirulito' },
+  { when: /polaroid|fotinh|foto revelad/, add: 'foto polaroid ima' },
+  // weight 1: the generic crachá/acesso rule also fires here and its cordões
+  // otherwise tie with the one product that actually does RFID.
+  { when: /aproxima|rfid|nfc|cartao de acesso|controle de acesso/, add: 'aproximacao', weight: 1 },
+  { when: /xerox|copias?\b|folhas? solt|folhas? avuls|imprimir (um |o )?(documento|arquivo)/, add: 'folhas avulsas' },
+  { when: /display|totem de mesa/, add: 'display' },
+  { when: /porta.?banner|suporte (de|para|pra) banner|cavalete|tripe/, add: 'porta banner' },
+  { when: /estrutura|trelica|box truss/, add: 'estrutura modular backdrop' },
+  { when: /\bmapa\b/, add: 'papel de parede mapa' },
+  { when: /post.?it|bloquinho adesivo|autoadesivo/, add: 'post it' },
   { when: /caderno|anotac|agenda/, add: 'caderno bloco' },
   { when: /palco|fundo de|backdrop|painel/, add: 'backdrop lona painel' },
   { when: /pendurar|parede externa|muro|tapume/, add: 'banner lona faixa' },
@@ -1911,7 +1925,9 @@ function buscaNoCatalogo(query: string): string {
   // Customer's own words, minus the ones that match everything.
   const kept = raw.split(/\s+/).filter((w) => w && !SEARCH_STOPWORDS.has(w))
   // Plus whatever this catalog calls the thing they described.
-  const intents = SEARCH_INTENTS.filter((r) => r.when.test(raw)).flatMap((r) => r.add.split(' '))
+  const intents = SEARCH_INTENTS.filter((r) => r.when.test(raw)).flatMap((r) =>
+    r.add.split(' ').map((w) => ({ w, weight: r.weight ?? 0.5 })),
+  )
   // If the phrase was nothing but stopwords, fall back to the raw words so we
   // still search something instead of returning "nada encontrado".
   const own = kept.length ? kept : raw.split(/\s+/).filter(Boolean)
@@ -1921,8 +1937,10 @@ function buscaNoCatalogo(query: string): string {
   const words: Array<{ w: string; weight: number }> = [
     ...new Set(own),
   ].map((w) => ({ w, weight: 1 }))
-  for (const w of new Set(intents)) {
-    if (!words.some((x) => x.w === w)) words.push({ w, weight: 0.5 })
+  for (const it of intents) {
+    const prev = words.find((x) => x.w === it.w)
+    if (!prev) words.push({ ...it })
+    else if (it.weight > prev.weight) prev.weight = it.weight
   }
   if (words.length === 0) return 'Termo de busca vazio.'
 
