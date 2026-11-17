@@ -89,6 +89,26 @@ Use pra saber o que perguntar e o que supor. Os preços e opções de verdade v�
 
 **Outros que a Quick tem:** cardápio (plastificado ou PVC), certificado, bloco/comanda (com vias), papel timbrado e receituário, envelope, pasta, marcador de página, postal, cartaz, calendário, ímã de geladeira, papel seda, sacola/saco de delivery, cartão fidelidade, wobbler, display, placa de PVC e imobiliária, botton, caneca, squeeze, caneta, mouse pad, capa de almofada, foto polaroid/ímã, lambe-lambe. Busque pelo nome.
 
+**Como o site monta cada produto** (o que existe pra escolher — confirme sempre na busca):
+- **Cartão Promocional:** couchê 250g (com verniz brilho na frente) ou 300g · cores 4x0, 4x1, 4x4 · corte: retangular, 2 ou 4 cantos arredondados, corte especial (acréscimo fixo no pedido).
+- **Cartão Express:** couchê 300g · 4x0 ou 4x4 · sem revestimento ou laminação fosca/brilho · cantos arredondados e furo de 4mm opcionais.
+- **Cartão Premium:** couchê 300g, laminação fosca + verniz localizado (só frente ou frente e verso) · 4x0, 4x1, 4x4.
+- **Panfleto Promocional:** couchê 90g · 10x14, 10x15, 14x20, 20x28, 28x40cm · 4x0, 4x1, 4x4. **Tradicional:** couchê 115g · 10x15 a 30x40cm. **Premium:** couchê 150g ou fosco 170g · 4x0 ou 4x4. Tradicional e Premium têm extras: dobra (1 ou 2), numeração e picote (acréscimo por unidade).
+- **Tag 9x5cm:** couchê 250g ou 300g · 4x0, 4x1, 4x4 · furo 4mm · formato retangular, ou especial (cantos arredondados, folha, chanfrado, box biju, cintura, oval, laço — acréscimo fixo).
+- **Etiqueta adesiva pronta:** quadrada, redonda ou retangular, de 1x1 a 10x10cm · papel adesivo brilho, vinil brilho, vinil transparente ou metalizado · sempre 4x0.
+- **Folha de adesivos (corte no formato da arte):** papel adesivo brilho ou fosco, couchê semi brilho, vinil brilho, fosco ou transparente, vinil metalizado (cada um com acréscimo por folha). Metalizado e transparente com tinta branca: revestimento verniz UV (padrão) ou laminação brilho, fosca, holográfica ou soft touch.
+- **Vitrine:** vinil impresso por m², ou **fundo vazado** (letras/logo recortados em vinil de cor — branco, preto, vermelho, amarelo, azul, verde, cinza, bege, laranja; prata e dourado com acréscimo). Plotter de recorte = mesma ideia, por m².
+- **Faixa (lona, por m²):** ilhós nas extremidades, bastão nas laterais, bastão e ilhós, corte reto ou corte reto com dupla face.
+- **Placa de PVC (por m², até 200x100cm):** chapa 1mm ou 2mm · brilho ou fosco · corte reto ou especial · laminação opcional · dupla face no verso opcional.
+- **Wind banner:** modelos faca, gota, pena ou vela · 65x190, 65x250, 65x300 ou 65x350cm · kit com haste e base.
+- **Papel de parede:** vinil fosco autocolante, rolo de 0,60m de largura em comprimentos de 1 a 3,5m.
+- **Crachá de PVC** 5,4x8,6cm: aceita dados variados (nome de cada pessoa) · frente colorida e verso branco, P&B ou colorido. **Cordão:** 12, 15 ou 20mm, clips jacaré ou mosquetão.
+- **Certificado A4:** apergaminhado 250g ou couchê 250/300g · 4x0 ou 4x4 · laminação opcional.
+- **Cardápio PVC:** 11x31, 15x21, 21x30, 30x42cm · 4x0 ou 4x4 · laminação brilho ou fosca, cantos arredondados.
+- **Apostila A4:** sulfite 75 ou 90g · capa em acetato · espiral ou wire-o · capa e miolo em P&B ou colorido.
+- **Caderno capa dura:** laminação brilho, fosca ou holográfica. **Revista:** 15x20 ou 20x30cm, couchê, grampeada, por número de páginas.
+- **Ímã de geladeira:** couchê imantado · corte reto, cantos arredondados ou corte especial. **Caneca:** porcelana, com alça e interior em várias cores.
+
 **Não sabe o que precisa** ("quero divulgar minha loja"): "As pessoas vão ver isso na rua, dentro da loja, ou vão receber na mão?" e sugira 1 ou 2 produtos.
 
 Pedido que o site não tem (formato, papel ou montagem diferente): não invente — "vou confirmar com a equipe o que dá pra fazer" e `chamar_equipe`.
