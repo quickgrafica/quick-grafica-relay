@@ -2669,12 +2669,12 @@ const AI_TOOLS: Anthropic.Messages.Tool[] = [
               descricao: {
                 type: 'string',
                 description:
-                  'Detalhe extra opcional (só aparece quando vira lista, com 4+ opções), ex: "R$ 400,00 — Couchê 90g, 4x0". No máximo 72 caracteres (o WhatsApp corta o resto): comece pelo preço, se tiver, e resuma o resto.',
+                  'Detalhe extra opcional (só aparece quando vira lista, com 4+ opções): uma frase curta de uso ou benefício, ex: "Aguenta água e umidade". SEM preço e sem acréscimo ("+R$ 3,00") — valor só no orçamento final (pedido do dono em 17/11). No máximo 72 caracteres.',
               },
               valor: {
                 type: 'string',
                 description:
-                  'Texto completo dessa escolha, como se o cliente tivesse digitado (inclua tamanho/papel/acabamento e preço se souber) — é isso que volta pra você quando o cliente clicar aqui.',
+                  'Texto completo dessa escolha, como se o cliente tivesse digitado (inclua tamanho/papel/acabamento, sem preço) — é isso que volta pra você quando o cliente clicar aqui.',
               },
             },
             required: ['titulo', 'valor'],
