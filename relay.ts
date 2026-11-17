@@ -3223,7 +3223,12 @@ function clienteContext(chatId: string): string | undefined {
   if (!info || info.totalConversas <= 1) return undefined
   const partes = [`Cliente já falou com a Quick Gráfica antes (${info.totalConversas}x ao todo).`]
   if (info.notas.length) {
-    partes.push(`Notas guardadas de atendimentos anteriores: ${info.notas.join(' | ')}`)
+    // On 17/11 an "Oi" after a week was answered with the old order ("pra
+    // seguir com os 100 adesivos...") because these notes read like an open
+    // task. They are background only; the customer decides what we talk about.
+    partes.push(
+      `Notas de atendimentos anteriores (só pra não perguntar de novo o que já sabe — não puxe esses assuntos; fale de pedido antigo só se o cliente falar): ${info.notas.join(' | ')}`,
+    )
   }
   return partes.join(' ')
 }
@@ -4411,6 +4416,10 @@ function paginasPdf(dados: Buffer): number {
   return dados.toString('latin1').match(/\/Type\s*\/Page(?![a-zA-Z])/g)?.length ?? 0
 }
 
+function temMidiaPendente(chatId: string): boolean {
+  return (midiasPendentes.get(chatId) ?? []).some((x) => Date.now() - x.chegou < MIDIA_VALIDADE_MS)
+}
+
 async function blocosDeMidia(chatId: string): Promise<{ blocos: Anthropic.Messages.ContentBlockParam[]; avisos: string[] }> {
   const lista = (midiasPendentes.get(chatId) ?? []).filter((x) => Date.now() - x.chegou < MIDIA_VALIDADE_MS)
   midiasPendentes.delete(chatId)
@@ -4856,6 +4865,34 @@ function semFraseCortada(text: string): string {
   return linhas.join('\n').trim()
 }
 
+// "Oi", "olá, tudo bem?", "bom dia!", "boa tarde Sophia" — a greeting and
+// nothing else. Anything with a request in it ("oi, quero banner") is not one.
+const SAUDACAO = /^(oi+e?|ol[aá]+|opa|e a[ií]|eai|hey|hello|hi|bom dia|boa tarde|boa noite|tudo bem|td bem|tudo bom|como vai|sophia|quick|gr[aá]fica|pessoal|amig[oa]|moc[ao]|ok)$/
+function ehSaudacao(texto: string): boolean {
+  const partes = normalize(texto)
+    .replace(/[^a-z\s]/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+  if (!partes.length || partes.length > 8) return false
+  // Greedy left-to-right: every word must belong to some greeting phrase.
+  let i = 0
+  while (i < partes.length) {
+    const tres = partes.slice(i, i + 3).join(' ')
+    const dois = partes.slice(i, i + 2).join(' ')
+    if (SAUDACAO.test(tres)) i += 3
+    else if (SAUDACAO.test(dois)) i += 2
+    else if (SAUDACAO.test(partes[i])) i += 1
+    else return false
+  }
+  return true
+}
+
+function primeiroNome(nome?: string): string {
+  const n = (nome ?? '').trim().split(/\s+/)[0] ?? ''
+  // Profile names like "~", "Loja 123" or emoji-only are not a name to greet.
+  return /^[A-Za-zÀ-ÿ]{2,}$/.test(n) ? n.charAt(0).toUpperCase() + n.slice(1).toLowerCase() : ''
+}
+
 async function handleWithAI(
   chatId: string,
   wamid: string,
@@ -4880,6 +4917,20 @@ async function handleWithAI(
     console.log(`ai: "${userText.trim().slice(0, 30)}" depois de "mais alguma coisa?" — botões de fechamento sem chamar a IA (chatId=${chatId})`)
     const buttons = await offersOrderButtons(chatId)
     if (!buttons.ok) await sendText(chatId, 'Posso fechar o pedido? É só me confirmar. 🙂')
+    return
+  }
+  // A bare greeting that opens a conversation gets the greeting back, from
+  // here — no model call. Asked for on 17/11: "Olá, Túlio, tudo bem? Em que
+  // posso te ajudar hoje?", not a recap of last week's order. Skipped when the
+  // customer came from an ad (Sophia opens with the ad's product) or sent a file.
+  if (ehSaudacao(userText) && buildHistory(chatId, seq).length === 0 && !anuncioContext(chatId) && !temMidiaPendente(chatId)) {
+    const nome = primeiroNome(clientes[chatId]?.nome || pushName)
+    const t = normalize(userText)
+    const abre = /bom dia/.test(t) ? 'Bom dia' : /boa tarde/.test(t) ? 'Boa tarde' : /boa noite/.test(t) ? 'Boa noite' : 'Olá'
+    const texto = `${abre}${nome ? `, ${nome}` : ''}, tudo bem? Em que posso te ajudar hoje? 😊`
+    console.log(`ai: saudação de início de conversa respondida sem chamar a IA (chatId=${chatId})`)
+    const sent = await sendText(chatId, texto)
+    if (!sent.ok) console.error('ai: send failed:', sent.data)
     return
   }
   try {
