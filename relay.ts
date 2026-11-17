@@ -3811,6 +3811,61 @@ const EQUIPE_MODELO_TEXTO =
 // One tap is one alert; tapping again a few minutes later is the same request.
 const AVISO_INTERVALO_MS = 30 * 60 * 1000
 const ultimoAviso = new Map<string, number>()
+
+// --- Waiting on the team: one "still on it" message (asked for on 17/11) ---
+//
+// After Sophia hands something to the team (urgent deadline, art creation,
+// "falar com equipe", a closed order), the customer waits. If nobody from the
+// team has written in that chat from the app after LEMBRETE_EQUIPE_MS, Sophia
+// sends one short message so the customer knows they were not forgotten.
+// Outside business hours it says when the team is back instead. One per
+// alert; a team reply, a Sophia pause or a newer alert cancels it.
+// LEMBRETE_EQUIPE_MIN in Railway changes the wait (0 turns it off).
+const lembreteMinEnv = Number(env('LEMBRETE_EQUIPE_MIN'))
+const LEMBRETE_EQUIPE_MS =
+  (env('LEMBRETE_EQUIPE_MIN') !== '' && Number.isFinite(lembreteMinEnv) && lembreteMinEnv >= 0 ? lembreteMinEnv : 10) * 60 * 1000
+const lembretesEquipe = new Map<string, ReturnType<typeof setTimeout>>()
+
+// Seg-sex, 8h30-18h30 em Brasília — o horário de atendimento do site.
+function horarioDeAtendimento(agora = new Date()): boolean {
+  const partes = Object.fromEntries(
+    new Intl.DateTimeFormat('en-US', { timeZone: 'America/Sao_Paulo', weekday: 'short', hour: 'numeric', minute: 'numeric', hour12: false })
+      .formatToParts(agora)
+      .map((x) => [x.type, x.value]),
+  )
+  if (partes.weekday === 'Sat' || partes.weekday === 'Sun') return false
+  const minutos = (Number(partes.hour) % 24) * 60 + Number(partes.minute)
+  return minutos >= 8 * 60 + 30 && minutos < 18 * 60 + 30
+}
+
+function agendarLembreteEquipe(chatId: string, tipo: 'pedido' | 'atendimento'): void {
+  if (LEMBRETE_EQUIPE_MS <= 0) return
+  if (EQUIPE_WHATSAPP && splitChat(chatId).to === EQUIPE_WHATSAPP) return
+  const anterior = lembretesEquipe.get(chatId)
+  if (anterior) clearTimeout(anterior)
+  const desde = Date.now()
+  const timer = setTimeout(() => {
+    lembretesEquipe.delete(chatId)
+    void enviarLembreteEquipe(chatId, tipo, desde)
+  }, LEMBRETE_EQUIPE_MS)
+  timer.unref?.()
+  lembretesEquipe.set(chatId, timer)
+}
+
+async function enviarLembreteEquipe(chatId: string, tipo: 'pedido' | 'atendimento', desde: number): Promise<void> {
+  const equipeRespondeu = log.some((e) => e.chatId === chatId && e.direction === 'out' && e.origem === 'eco' && e.timestamp >= desde)
+  if (equipeRespondeu || sophiaPausada(chatId) || emSombra(chatId)) return
+  const nome = primeiroNome(clientes[chatId]?.nome)
+  const oi = nome ? `${nome}, ` : ''
+  const texto = !horarioDeAtendimento()
+    ? `${oi}nossa equipe atende de segunda a sexta, das 8h30 às 18h30. Já deixei tudo anotado e eles te respondem por aqui assim que voltarem. 🙂`
+    : tipo === 'pedido'
+      ? `${oi}seu pedido já está com a equipe — eles te chamam por aqui pra combinar pagamento e arte. Qualquer dúvida, é só me falar. 🙂`
+      : `${oi}ainda estou vendo isso com a equipe, já já te dou um retorno por aqui. Se quiser adiantar, pode me mandar a arte ou qualquer detalhe. 🙂`
+  const r = await sendText(chatId, texto)
+  if (r.ok) console.log(`lembrete-equipe: ${chatId} sem resposta da equipe em ${Math.round(LEMBRETE_EQUIPE_MS / 60000)} min — cliente avisado`)
+  else console.error('lembrete-equipe: falhou:', r.data)
+}
 const modeloStatus = new Map<string, { status: string; motivo?: string; at: number }>()
 const MODELO_RECHECK_MS = 10 * 60 * 1000
 
@@ -3910,6 +3965,7 @@ async function avisarEquipe(chatId: string, pushName?: string, motivo?: string, 
     return
   }
   ultimoAviso.set(chaveAviso, Date.now())
+  agendarLembreteEquipe(chatId, setor === 'pedido-fechado' ? 'pedido' : 'atendimento')
 
   const { to, phoneId } = splitChat(chatId)
   const nome = clientes[chatId]?.nome || pushName || 'não informado'
@@ -5307,6 +5363,11 @@ function registrarEcos(phoneId: string, echoes: WaEcho[], pausar = true): void {
     const texto = textoEco(e).trim()
     if (!texto) continue
     logMessage({ direction: 'out', chatId, text: texto, timestamp: Date.now(), wamid: e.id, origem: 'eco' })
+    const lembrete = lembretesEquipe.get(chatId)
+    if (lembrete) {
+      clearTimeout(lembrete)
+      lembretesEquipe.delete(chatId)
+    }
     // Replies from Meta's agent (standby) are not a person taking over: they
     // must not silence Sophia once the agent hands the conversation to us.
     if (pausar && !emSombra(chatId) && PAUSA_HUMANO_MS > 0) {
