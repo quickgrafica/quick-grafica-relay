@@ -1539,6 +1539,43 @@ function formatSiblings(e: CatalogEntry, p: ApiProduct): string[] {
   return out
 }
 
+// The same product in the same size, sold in other materials / colours /
+// finishes: on the site these are options of one product page; in the API each
+// is its own record. Without this the assistant saw only the record the search
+// ranked first and quoted it — on 17/11 "100 adesivos 5x5cm redondo" came back
+// priced in Papel Adesivo Brilho without asking which model the customer
+// wanted. Listed per attribute, so each becomes one question before the price.
+const ATRIBUTOS_IRMAOS: Array<[keyof ApiProduct, string]> = [
+  ['material', 'Material/modelo'],
+  ['cores', 'Cores'],
+  ['acabamento', 'Acabamento'],
+  ['revestimento', 'Revestimento'],
+]
+function opcoesIrmas(e: CatalogEntry, p: ApiProduct): string[] {
+  const titulo = normalize(p.titulo)
+  const irmaos = CATALOG_ENTRIES.filter(
+    (o) =>
+      o.api &&
+      o.subcategory === e.subcategory &&
+      normalize(o.api.titulo) === titulo &&
+      (!p.formato || !o.api.formato || sameValue(o.api.formato, p.formato)),
+  )
+  if (irmaos.length < 2) return []
+  const out: string[] = []
+  for (const [campo, rotulo] of ATRIBUTOS_IRMAOS) {
+    const valores = new Map<string, string>()
+    for (const o of irmaos) {
+      const v = String(o.api![campo] ?? '').trim()
+      if (!v || valores.has(normalize(v))) continue
+      // No prices here: a list of every model with its price is exactly the
+      // "despejar opções" the customer gets asked about first.
+      valores.set(normalize(v), v)
+    }
+    if (valores.size > 1) out.push(`[${rotulo}] ${[...valores.values()].join('; ')}`)
+  }
+  return out
+}
+
 function describeApiEntry(e: CatalogEntry, p: ApiProduct): string {
   const fixed = [
     p.formato && `Formato: ${p.formato}`,
@@ -1608,6 +1645,12 @@ function describeApiEntry(e: CatalogEntry, p: ApiProduct): string {
   // records titled "Banner", one per Formato. Search shows at most two of them,
   // so without this line the assistant concluded the other sizes didn't exist
   // ("tamanhos fixos 40x60 e 60x90") and sent 90x120 to the per-m² route.
+  const irmas = opcoesIrmas(e, p)
+  if (irmas.length) {
+    lines.push(
+      `OUTRAS OPÇÕES DESTE MESMO PRODUTO NESTE TAMANHO (cada uma é uma ficha com preço próprio — pergunte ao cliente antes do preço, a menos que ele já tenha dito ou seja um padrão das instruções; depois busque a escolhida): ${irmas.join(' || ')}`,
+    )
+  }
   const outros = formatSiblings(e, p)
   if (outros.length) {
     lines.push(
