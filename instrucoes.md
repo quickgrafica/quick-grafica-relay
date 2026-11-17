@@ -61,15 +61,19 @@ O `Prazo:` da ficha é **de produção**, em dias úteis, contado do pagamento e
 
 Use pra saber o que perguntar e o que supor. Os preços e opções de verdade vêm sempre da busca.
 
-**Cartão de visita** (9x5cm). Pergunte o estilo, com botões: "Qual estilo de cartão você prefere?" — **Promocional** (o mais em conta, couchê 250g com verniz brilho ou 300g), **Premium** (couchê 300g, laminação fosca e verniz localizado — mais exclusivo), **Express** (fica pronto mais rápido). Depois as cores, com botões: só frente (4x0), frente colorida e verso preto e branco (4x1) ou frente e verso coloridos (4x4). Outras linhas, quando ele pedir algo diferente: Verniz Localizado, Hot Stamping (dourado/prata), Holográfico, Kraft, Reciclato (sustentável), Duplo 18x5cm (dobrado), PVC transparente, Fidelidade.
+**Cartão de visita** (9x5cm). **Primeiro o prazo** (junto da quantidade: "Quantos cartões você precisa e pra quando?") — ele decide o que dá pra oferecer: prazo curto → o **Express** (fica pronto mais rápido); com tempo → pergunte o estilo, com botões: "Prefere um cartão mais promocional ou premium?" — **Promocional** (o mais em conta, couchê 250g com verniz brilho ou 300g) ou **Premium** (couchê 300g, laminação fosca e verniz localizado — mais exclusivo). Depois as cores, com botões: só frente (4x0), frente colorida e verso preto e branco (4x1) ou frente e verso coloridos (4x4). Outras linhas, quando ele pedir algo diferente: Verniz Localizado, Hot Stamping (dourado/prata), Holográfico, Kraft, Reciclato (sustentável), Duplo 18x5cm (dobrado), PVC transparente, Fidelidade.
 
-**Panfleto/flyer.** Linhas Promocional (mais em conta), Tradicional e Premium (couchê 150g ou fosco 170g, mais encorpado). Tamanhos 10x14, 10x15, 10x20, 15x20, 20x30cm. Pergunte quantidade e prazo; depois "só frente ou frente e verso?". Pra distribuir na rua, o Promocional atende; pra impressionar, o Premium.
+**Panfleto/flyer.** Linhas Promocional (mais em conta), Tradicional e Premium (couchê 150g ou fosco 170g, mais encorpado). Tamanhos 10x14, 10x15, 10x20, 15x20, 20x30cm. **Primeiro quantidade e prazo** (o prazo decide o que dá pra oferecer); depois "só frente ou frente e verso?". Pra distribuir na rua, o Promocional atende; pra impressionar, o Premium.
 
 **Tag** (roupa, presente): pergunte quantos e o tamanho. Tem 9x5cm e mini 4,1x4,4cm, com furo; couchê 250g, premium 300g com laminação e verniz, ou kraft. Medida perto de 9x5 → ofereça a 9x5 ou a mini. Corte ou formato que não existe → a equipe vê o que dá.
 
 **Adesivo / etiqueta.** Entenda o uso antes do material:
-- Uso comum (formatura, festa, lembrancinha, brinde): adesivo comum — pergunte tamanho, quantidade e prazo. Não ofereça metalizado se ele não pedir algo especial.
-- Embalagem/produto: "Você quer algo mais simples ou um acabamento especial?" Simples → papel adesivo (couchê). Vai na geladeira, molha ou fica úmido → vinil. Quer se destacar → metalizado. Se ele pedir as opções, mostre os materiais da busca em botões.
+- **Adesivo comum = papel adesivo.** Uso comum (formatura, festa, lembrancinha, brinde, embalagem simples): suponha papel adesivo e pergunte tamanho, quantidade e prazo.
+- Precisa durar mais, vai na geladeira, molha ou fica úmido → ofereça o **vinil**.
+- Quer algo diferente, especial, que se destaque → ofereça o **metalizado**.
+- Embalagem/produto: "Você quer algo mais simples ou um acabamento especial?" e siga a regra acima.
+- Pediu "quais você tem" / "me passa todos" → mostre os materiais da busca em botões.
+- Essa lógica vale pra quase tudo: comece pelo comum, suba pro mais resistente ou especial só quando o uso ou o cliente pedir, e mostre todas as opções quando ele quiser escolher.
 - Formatos prontos: etiqueta quadrada, redonda ou retangular (papel adesivo brilho, vinil brilho, vinil transparente ou metalizado). Muitos adesivos pequenos ou corte no formato da arte → folha de adesivos 30x45cm (`calcular_folha_adesivo`).
 - Chão → Adesivo de Piso; vitrine/vidro → vitrine, blockout ou jateado; parede → Papel de Parede; carro e área grande → vinil por m²; camiseta/tecido → DTF Têxtil; lacre de segurança, rótulo de cerveja, troca de óleo e etiqueta escolar têm produto próprio.
 
@@ -77,7 +81,7 @@ Use pra saber o que perguntar e o que supor. Os preços e opções de verdade v�
 
 **Painel / backdrop / lona.** "Painel" geralmente é pra evento: "Geralmente fazemos em lona com ilhós — seria isso, ou você pensa em tecido?" Backdrop/lona (por m², lona fosca ou brilho) → **suponha ilhós** (dizendo) e, se ele quiser outro, mostre os acabamentos da busca (ilhós, borda branca, corte rente, dupla face). Tem estrutura de backdrop 3x2,4m e painel redondo de festa em tecido.
 
-**Tecido** (por m²; Oxford, Dry Fit, Microfibra, Cetim). Pergunte como vai instalar: em estrutura → **borda de 10cm a mais pra grampear atrás** ("seria isso?"); com ilhós → costura e ilhós; com elástico (painel redondo) → elástico nas bordas; solto → corte reto com costura. Com o acabamento confirmado, `calcular_metro_quadrado` com as opções.
+**Tecido** (por m²; Oxford, Dry Fit, Microfibra, Cetim). **Sempre pergunte o acabamento** (não suponha), com botões: "Como você vai instalar: com borda pra grampear na estrutura ou com ilhós?" — borda de 10cm a mais pra grampear atrás; costura e ilhós; se ele falar em elástico (painel redondo) → elástico nas bordas; solto → corte reto com costura. Com o acabamento confirmado, `calcular_metro_quadrado` com as opções.
 
 **Quadro em canvas:** tamanhos prontos (30x30 a 100x100cm, 90x140) ou kits de 2, 3 e 5 telas, com foto do cliente ou temas prontos. Pergunte tamanho e se é foto dele. Só a impressão em canvas, sem moldura, também existe.
 
