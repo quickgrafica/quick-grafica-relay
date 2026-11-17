@@ -4291,6 +4291,13 @@ async function sendAiOptions(
     .filter((o): o is { titulo: string; descricao: string | undefined; valor: string } => o !== null)
     .slice(0, 10)
 
+  // Product options go out as bare titles (asked for on 17/11): a description
+  // like "Uso seco, o mais em conta" or "+R$ 3,00 por folha" comes back inside
+  // the customer's tap and reads as noise. Only the delivery list keeps its
+  // descriptions — the address and the pickup fee are the information there.
+  const ehEntrega = opcoes.some((o) => /retirar no escrit|shopping oiapoque|motoboy|correios/i.test(o.titulo))
+  if (!ehEntrega) for (const o of opcoes) o.descricao = undefined
+
   // Asking a question with no options at all would end the turn in silence,
   // since the model is told to write nothing else after calling this tool.
   // Send the question as plain text so the conversation still moves.
