@@ -158,6 +158,7 @@ Produto, preço, prazo e opções só de `buscar_catalogo` (ou destas instruçõ
 Ferramentas (só estas): `buscar_catalogo`, `mostrar_opcoes`, `comparar_precos`, `calcular_metro_quadrado`, `calcular_folha_adesivo`, `calcular_cartela_tatuagem`, `oferecer_fechamento`, `chamar_equipe`, `salvar_nota_cliente`.
 
 **Marcas da busca:**
+- `MAIS TAMANHOS/VERSÕES DE …`: esses tamanhos existem e têm preço. Quando o cliente não disse o tamanho, ofereça **todos** (os de cima + os desta linha), nunca só os que vieram com ficha; para o preço de um deles, busque pelo nome exato.
 - `FIXO:` informe, não pergunte. `ESCOLHAS:` lista fechada; cada grupo `[...]` é uma pergunta. `ESCOLHAS: NENHUMA` → confirme a quantidade. `ESTA VERSÃO:` é informação.
 - `PREÇO:` `500un: R$ 89,90` é o total da faixa; `1-5un: R$ 10,90/un` é por unidade. Quantidade fora da tabela: ofereça as faixas reais acima e abaixo, nunca proporcional.
 - Acréscimos: `(+R$ 0,06/un)` multiplica pela quantidade; `(+R$ 180,00 FIXO)` soma uma vez; `(+R$ 5,00/m²)` a calculadora soma; `A CONFIRMAR` → a equipe confirma.

@@ -1799,6 +1799,8 @@ const SEARCH_INTENTS: Array<{ when: RegExp; add: string }> = [
   { when: /parede/, add: 'papel de parede adesivo vitrine' },
   { when: /quadro|decorar|decoracao|sala|quarto|ambiente/, add: 'quadro decorativo canvas' },
   { when: /cardapio|restaurante|lanchonete|bar |pizzaria|menu do/, add: 'cardapio' },
+  // Customers write it every way but the catalog's: "button", "boton", "botom".
+  { when: /butto|boton|botom|bottom|buton/, add: 'botton' },
   { when: /brinde|lembranc|souvenir|mimo|presente|sorteio/, add: 'caneca caneta squeeze copo termico botton mouse pad' },
   { when: /caixa de luz|luminoso|iluminad|backlight/, add: 'lona backlight' },
   { when: /embalagem|rotulo|pote|frasco|garrafa|sache|produto meu/, add: 'adesivo rotulo etiqueta embalagens' },
@@ -1884,6 +1886,24 @@ function searchCatalog(query: string, quantidade?: number): string {
   }
 }
 
+// "bottons", "cartoes", "adesivos": customers ask in the plural while the
+// product names are singular, and a plain substring test misses "bottons" vs
+// "Botton 44mm". Returns the word and its singular so either can match.
+function formasDaPalavra(w: string): string[] {
+  const out = [w]
+  if (w.length > 4) {
+    if (w.endsWith('oes') || w.endsWith('aes')) out.push(w.slice(0, -3) + 'ao')
+    else if (w.endsWith('ais')) out.push(w.slice(0, -3) + 'al')
+    else if (w.endsWith('eis')) out.push(w.slice(0, -3) + 'el')
+    else if (w.endsWith('ns')) out.push(w.slice(0, -2) + 'm')
+    else if (/[rz]es$/.test(w)) out.push(w.slice(0, -2))
+    // Plain "-s" is always tried too: "bottons" must reach "botton", not only
+    // the "-ns → -m" form ("bottom") that a word like "homens" needs.
+    if (w.endsWith('s') && !w.endsWith('ss')) out.push(w.slice(0, -1))
+  }
+  return [...new Set(out)]
+}
+
 function buscaNoCatalogo(query: string): string {
   const raw = normalize(query)
   if (!raw.trim()) return 'Termo de busca vazio.'
@@ -1926,17 +1946,18 @@ function buscaNoCatalogo(query: string): string {
       // weaker one: the category "banners-e-faixas" contains the words "banner"
       // and "faixa", so without this gap every product in it — a Placa
       // Imobiliária included — tied with the actual Banner.
-      if (name.includes(w)) {
+      const formas = formasDaPalavra(w)
+      if (formas.some((f) => name.includes(f))) {
         hit += 8
         // A product whose name *starts* with the word usually IS the thing
         // asked for, rather than something that merely mentions it: "Crachá de
         // PVC" should beat "Cordão para crachá" on a search for "crachá".
-        if (name.startsWith(w)) hit += 4
-      } else if (section.includes(w)) hit += 3
+        if (formas.some((f) => name.startsWith(f))) hit += 4
+      } else if (formas.some((f) => section.includes(f))) hit += 3
       // Count repeated body mentions too (relevant products tend to repeat
       // the term across variations/tiers), but cap so one huge options list
       // can't out-rank a real name match.
-      const bodyHits = body.split(w).length - 1
+      const bodyHits = Math.max(...formas.map((f) => body.split(f).length - 1))
       hit += Math.min(bodyHits, 3)
       score += hit * weight
     }
@@ -2048,6 +2069,26 @@ function buscaNoCatalogo(query: string): string {
   // escalates for a product that was, in fact, found. Send it truncated instead.
   if (!out && top.length > 0) {
     out = `${describeEntry(top[0]).slice(0, MAX_SEARCH_CHARS)}\n[ficha cortada por tamanho — se precisar de um detalhe que não apareceu, pergunte à equipe em vez de supor]\n`
+  }
+
+  // Real bug (Botton, 17/11): the family has 32/37/44/58mm, MAX_PER_HEADING let
+  // two through, and the other two were dropped from the "outros" list below
+  // because their family name was already shown — so the assistant told the
+  // customer there were only two sizes. Every size the cap hid is named here.
+  const ocultos = new Map<string, string[]>()
+  for (const e of rest) {
+    const key = baseName(e.heading)
+    if (!seen.has(key)) continue
+    const semEspaco = (t: string) => normalize(t).replace(/\s+/g, '')
+    const label = e.api?.formato && !semEspaco(e.heading).includes(semEspaco(e.api.formato))
+      ? `${e.heading} (${e.api.formato})`
+      : e.heading
+    const list = ocultos.get(key) ?? []
+    if (!list.includes(label) && list.length < 10) list.push(label)
+    ocultos.set(key, list)
+  }
+  for (const [key, list] of ocultos) {
+    out += `MAIS TAMANHOS/VERSÕES DE "${key}" ALÉM DOS MOSTRADOS ACIMA (existem e têm preço — busque pelo nome exato se o cliente quiser): ${list.join('; ')}\n`
   }
 
   // Names only (cheap) of other products that also matched, so the assistant
