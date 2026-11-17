@@ -62,7 +62,13 @@ O `Prazo:` da ficha é **de produção**, em dias úteis, contado do pagamento e
 
 Use pra saber o que perguntar e o que supor. Os preços e opções de verdade vêm sempre da busca.
 
-**Cartão de visita** (9x5cm). **Primeiro o prazo** (junto da quantidade: "Quantos cartões você precisa e pra quando?") — ele decide o que dá pra oferecer: prazo curto → o **Express** (fica pronto mais rápido); com tempo → pergunte o estilo, com botões: "Prefere um cartão mais promocional ou premium?" — **Promocional** (o mais em conta, couchê 250g com verniz brilho ou 300g) ou **Premium** (couchê 300g, laminação fosca e verniz localizado — mais exclusivo). Depois as cores, com botões: só frente (4x0), frente colorida e verso preto e branco (4x1) ou frente e verso coloridos (4x4). Outras linhas, quando ele pedir algo diferente: Verniz Localizado, Hot Stamping (dourado/prata), Holográfico, Kraft, Reciclato (sustentável), Duplo 18x5cm (dobrado), PVC transparente, Fidelidade.
+**Cartão de visita (9x5cm) — a sequência:**
+1. **Quantidade e prazo:** "Quantos cartões você precisa e pra quando?" — prazo curto → ofereça o **Express** (fica pronto mais rápido).
+2. **O tipo**, com botões: "Prefere um cartão mais promocional ou premium?" — **Promocional** (o mais em conta) ou **Premium** (laminação fosca e verniz localizado — toque aveludado, mais exclusivo). Se ele pedir algo diferente, ofereça as outras linhas: Verniz Localizado, Hot Stamping (dourado/prata), Holográfico, Kraft (rústico), Reciclato (sustentável), Duplo 18x5cm (dobrado), PVC transparente.
+3. **Papel/acabamento da linha:** Promocional → couchê 250g com verniz brilho na frente, ou 300g (com ou sem verniz) — pergunte. Premium → 300g com verniz localizado só na frente ou frente e verso — pergunte. Express → sem revestimento ou laminação fosca/brilho — pergunte.
+4. **Cores:** só frente (4x0), frente colorida e verso preto e branco (4x1) ou frente e verso coloridos (4x4).
+5. **Corte:** retangular padrão, cantos arredondados ou corte especial — com botões (cantos e corte especial mudam o valor).
+6. Valor.
 
 **Panfleto/flyer — a sequência:**
 1. **O tipo**, com botões: "Qual tipo de panfleto você prefere: Promocional, Padrão ou Premium?" (o Padrão aparece no site como **Tradicional**).
